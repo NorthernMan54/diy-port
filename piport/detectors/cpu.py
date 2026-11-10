@@ -132,9 +132,4 @@ class CpuDetector(Detector):
         batched = chw[np.newaxis, ...].astype(self._in_dtype)
         outputs = self._session.run(None, {self._input_name: batched})
         outputs = [np.asarray(o, dtype=np.float32) for o in outputs]
-        if self._mode == "ultralytics":
-            return postprocess.post_process_ultralytics(outputs[0])
-        if self._mode == "anchor_free":
-            return postprocess.post_process_anchor_free(outputs[0])
-        size = (self.input_size, self.input_size)
-        return postprocess.post_process_raw_heads(outputs, self._anchors, size)
+        return postprocess.decode(self._mode, outputs, self._anchors, self.input_size)

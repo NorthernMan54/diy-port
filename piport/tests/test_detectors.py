@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 hutchx86
 """Unit tests for the detectors package: the shared YOLO/SSD post-processing,
-backend selection, and the Edge TPU input/output helpers. Skipped if numpy
-isn't importable; no accelerator runtime is needed.
+backend selection, and the Edge TPU / OpenVINO helpers. Skipped if numpy
+isn't importable; no accelerator is needed. The OpenVINO runtime tests build
+tiny models in memory and run them on OpenVINO's CPU plugin (skipped without
+`pip install openvino`).
 """
 import os
 import sys
@@ -20,11 +22,18 @@ try:
     from detectors import postprocess
     from detectors import edgetpu
     from detectors import cpu
+    from detectors import openvino as ovdet
     from detectors.edgetpu import EdgeTpuDetector
     _IMPORT_ERR = None
 except Exception as exc:  # numpy missing, etc.
     detectors = None
     _IMPORT_ERR = exc
+
+try:
+    import openvino as ov
+    from openvino import opset13 as ops
+except Exception:  # not installed, or too old for opset13
+    ov = None
 
 
 @unittest.skipIf(detectors is None, f"detectors unavailable ({_IMPORT_ERR})")
@@ -165,6 +174,11 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(self._with(detectors.resolve, edgetpu=True, cpu=True).NAME, "edgetpu")
         self.assertEqual(self._with(detectors.resolve, cpu=True).NAME, "cpu")
 
+    def test_auto_takes_openvino_after_tpu_before_cpu(self):
+        self.assertEqual(self._with(detectors.resolve, edgetpu=True, openvino=True,
+                                    cpu=True).NAME, "edgetpu")
+        self.assertEqual(self._with(detectors.resolve, openvino=True, cpu=True).NAME, "openvino")
+
     def test_auto_none_available(self):
         with self.assertRaises(RuntimeError) as cm:
             self._with(detectors.resolve)
@@ -180,6 +194,7 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(detectors.resolve("auto", "/x/y.rknn").NAME, "rknn")
         self.assertEqual(detectors.resolve("auto", "/x/y.tflite").NAME, "edgetpu")
         self.assertEqual(detectors.resolve("auto", "/x/y.ONNX").NAME, "cpu")
+        self.assertEqual(detectors.resolve("auto", "/x/yolo.xml").NAME, "openvino")
 
     def test_unknown_name(self):
         with self.assertRaises(ValueError):
@@ -433,6 +448,149 @@ class TestCropDetection(unittest.TestCase):
             out = postprocess.resize(frame, 2)
         self.assertEqual(out.shape, (2, 2, 3))
         self.assertTrue((out[1, 1] == frame[2, 2]).all())
+
+
+@unittest.skipIf(detectors is None, f"detectors unavailable ({_IMPORT_ERR})")
+class TestOpenVinoDevice(unittest.TestCase):
+    """AIPORT_OV_DEVICE: auto = first GPU, then NPU, then CPU; else passed through."""
+
+    def setUp(self):
+        saved = os.environ.pop("AIPORT_OV_DEVICE", None)
+        if saved is not None:
+            self.addCleanup(os.environ.__setitem__, "AIPORT_OV_DEVICE", saved)
+        self.addCleanup(os.environ.pop, "AIPORT_OV_DEVICE", None)
+
+    def test_auto_order(self):
+        self.assertEqual(ovdet._ov_device(["CPU", "NPU", "GPU"]), "GPU")
+        self.assertEqual(ovdet._ov_device(["CPU", "GPU.0", "GPU.1"]), "GPU.0")
+        self.assertEqual(ovdet._ov_device(["CPU", "NPU"]), "NPU")
+        self.assertEqual(ovdet._ov_device(["CPU"]), "CPU")
+        self.assertEqual(ovdet._ov_device([]), "CPU")
+
+    def test_explicit_device_passed_through(self):
+        os.environ["AIPORT_OV_DEVICE"] = " npu "
+        self.assertEqual(ovdet._ov_device(["CPU", "GPU"]), "NPU")  # even if not listed
+        self.assertEqual(ovdet._ov_device(["CPU"], want="AUTO:GPU,CPU"), "AUTO:GPU,CPU")
+        self.assertEqual(ovdet._ov_device(["CPU", "GPU"], want="Auto"), "GPU")
+
+
+@unittest.skipIf(detectors is None, f"detectors unavailable ({_IMPORT_ERR})")
+class TestIntelAccelerators(unittest.TestCase):
+    """The sysfs probe behind available(): Intel vendor id *and* a visible /dev node."""
+
+    def _root(self, nodes):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for cls, dev_dir, name, vendor, has_dev in nodes:
+            d = os.path.join(tmp.name, "sys/class", cls, name, "device")
+            os.makedirs(d)
+            with open(os.path.join(d, "vendor"), "w") as f:
+                f.write(vendor + "\n")
+            if has_dev:
+                os.makedirs(os.path.join(tmp.name, dev_dir), exist_ok=True)
+                open(os.path.join(tmp.name, dev_dir, name), "w").close()
+        return tmp.name
+
+    def test_intel_gpu_and_npu(self):
+        root = self._root([("drm", "dev/dri", "renderD128", "0x8086", True),
+                           ("accel", "dev/accel", "accel0", "0x8086", True)])
+        self.assertEqual(ovdet._intel_accelerators(root), ["GPU", "NPU"])
+
+    def test_other_vendor_ignored(self):
+        root = self._root([("drm", "dev/dri", "renderD128", "0x10de", True),  # NVIDIA
+                           ("drm", "dev/dri", "renderD129", "0x8086", True)])
+        self.assertEqual(ovdet._intel_accelerators(root), ["GPU"])
+        self.assertEqual(ovdet._intel_accelerators(self._root(
+            [("drm", "dev/dri", "renderD128", "0x1002", True)])), [])  # AMD
+
+    def test_sysfs_without_dev_node(self):
+        # A container sees the host's sysfs but no /dev/dri unless it is passed through.
+        root = self._root([("drm", "dev/dri", "renderD128", "0x8086", False)])
+        self.assertEqual(ovdet._intel_accelerators(root), [])
+
+    def test_available_needs_accelerator(self):
+        with mock.patch.dict(sys.modules, {"openvino": mock.MagicMock()}), \
+                mock.patch.object(ovdet, "_intel_accelerators", return_value=[]):
+            ok, why = ovdet.OpenVinoDetector.available()
+        self.assertFalse(ok)
+        self.assertIn("no Intel GPU", why)
+
+
+@unittest.skipIf(detectors is None or ov is None,
+                 "openvino not installed (pip install openvino)")
+class TestOpenVinoRuntime(unittest.TestCase):
+    """End to end on OpenVINO's CPU plugin with tiny in-memory models."""
+
+    def setUp(self):
+        import tempfile
+        self._env = mock.patch.dict(os.environ, {"AIPORT_OV_DEVICE": "CPU",
+                                                 "AIPORT_OV_CACHE_DIR": ""})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    @staticmethod
+    def _identity(shape, et):
+        p = ops.parameter(shape, et, name="images")
+        return ov.Model([ops.result(p)], [p], "identity")
+
+    def _save_anchor_free(self, side=320, dynamic=False):
+        """[1,84,1] anchor-free output: one person box at model-space xywh (100,50,20,10),
+        tied to the input so the parameter stays live."""
+        shape = [1, 3, -1, -1] if dynamic else [1, 3, side, side]
+        p = ops.parameter(ov.PartialShape(shape), np.float32, name="images")
+        const = np.zeros((1, 84, 1), np.float32)
+        const[0, :4, 0] = [100, 50, 20, 10]
+        const[0, 4 + 0, 0] = 0.9  # person
+        zero = ops.multiply(ops.reduce_sum(p, np.array([1, 2, 3]), keep_dims=False),
+                            np.float32(0))
+        out = ops.add(ops.constant(const), ops.reshape(zero, np.array([1, 1, 1]), False))
+        path = os.path.join(self.tmp, "anchor_free.xml")
+        ov.save_model(ov.Model([ops.result(out)], [p], "af"), path)
+        return path
+
+    def _run_prepared(self, model, frame):
+        model, side = ovdet._prepare_model(ov, model)
+        out = ov.Core().compile_model(model, "CPU")({0: frame})[0]
+        return out, side
+
+    def test_preprocess_uint8_nhwc_to_scaled_nchw(self):
+        frame = np.random.default_rng(0).integers(0, 256, (1, 4, 4, 3), dtype=np.uint8)
+        want = frame.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        for et, tol in ((np.float32, 1e-6), (np.float16, 1e-3)):  # Ultralytics ONNX is fp16
+            out, side = self._run_prepared(self._identity([1, 3, 4, 4], et), frame)
+            self.assertEqual((out.dtype, side), (np.float32, 4), et)
+            np.testing.assert_allclose(out, want, atol=tol)
+
+    def test_detect_end_to_end(self):
+        path = self._save_anchor_free(320)
+        self.assertEqual(detectors.resolve("auto", path), ovdet.OpenVinoDetector)
+        det = detectors.create("openvino", path)
+        self.assertEqual((det.device, det.input_size, det._mode), ("CPU", 320, "anchor_free"))
+        res = det.detect(np.zeros((640, 640, 3), np.uint8))
+        self.assertEqual((res[0]["objectType"], res[0]["label"]), ("person", "person"))
+        # model xyxy (90,45,110,55) at 320 -> (180,90,220,110) at 640
+        self.assertEqual([round(v, 3) for v in res[0]["box"]], [180.0, 90.0, 220.0, 110.0])
+
+    def test_dynamic_input_pinned_to_640(self):
+        det = ovdet.OpenVinoDetector(self._save_anchor_free(dynamic=True))
+        self.assertEqual(det.input_size, 640)
+        self.assertEqual(len(det.detect(np.zeros((640, 640, 3), np.uint8))), 1)
+
+    def test_bad_device_falls_back_to_cpu(self):
+        os.environ["AIPORT_OV_DEVICE"] = "NO_SUCH_DEVICE"
+        with self.assertLogs("aiport-detector", "ERROR"):
+            det = ovdet.OpenVinoDetector(self._save_anchor_free())
+        self.assertEqual(det.device, "CPU")
+
+    def test_compile_cache_written(self):
+        cache = os.path.join(self.tmp, "cache")
+        os.environ["AIPORT_OV_CACHE_DIR"] = cache
+        ovdet.OpenVinoDetector(self._save_anchor_free())
+        self.assertTrue(os.listdir(cache))
 
 
 if __name__ == "__main__":

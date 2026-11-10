@@ -6,8 +6,10 @@
 #
 #   docker build -f docker/Dockerfile -t piport-cpu .                       # CPU
 #   docker build -f docker/Dockerfile --build-arg ACCEL=edgetpu -t piport .  # Coral
+#   docker build -f docker/Dockerfile --build-arg ACCEL=openvino -t piport-openvino .  # Intel GPU
 #
-# ACCEL picks the detector backend baked in: cpu (default) | edgetpu | none.
+# ACCEL picks the detector backend baked in: cpu (default) | edgetpu | openvino
+# (amd64 only; run with --device /dev/dri) | none.
 # The RK3588 NPU backend is not offered in the image -- use scripts/install.sh
 # on that board. See docker/README.md.
 
@@ -20,11 +22,17 @@ ARG LIBEDGETPU_TAG=16.0TF2.19.1-1
 ARG LIBEDGETPU_VER=16.0tf2.19.1-1
 ARG LIBEDGETPU_SHA256_ARM64=df9e9b16c802f4e4ad6fd8d9d0866d25eff8ddef989813f398794546d267bd11
 ARG LIBEDGETPU_SHA256_AMD64=764d1bc680f65440ca1c8aca1d33ce986d7ca652b984ae0fc744d04b2f896e53
+# Intel GPU compute runtime for openvino (trixie has no intel-opencl-icd); same pinned
+# compute-runtime/IGC debs and digests as scripts/install.sh.
+ARG NEO_TAG=26.35.39758.10
+ARG IGC_TAG=v2.41.5
+ARG IGC_VER=2.41.5+22716
+ARG GMMLIB_VER=22.10.0
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # hadolint ignore=DL3008
-RUN case "$ACCEL" in cpu|edgetpu|none) ;; *) echo "ACCEL must be cpu|edgetpu|none" >&2; exit 1 ;; esac \
+RUN case "$ACCEL" in cpu|edgetpu|openvino|none) ;; *) echo "ACCEL must be cpu|edgetpu|openvino|none" >&2; exit 1 ;; esac \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
         python3 python3-venv ffmpeg iproute2 procps ca-certificates curl \
@@ -41,6 +49,26 @@ RUN case "$ACCEL" in cpu|edgetpu|none) ;; *) echo "ACCEL must be cpu|edgetpu|non
         apt-get install -y --no-install-recommends "/tmp/$deb"; \
         rm -f "/tmp/$deb"; \
     fi \
+ && if [ "$ACCEL" = "openvino" ]; then \
+        [ "$TARGETARCH" = "amd64" ] || { echo "openvino: amd64 only, got '$TARGETARCH'" >&2; exit 1; }; \
+        igc="https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}"; \
+        neo="https://github.com/intel/compute-runtime/releases/download/${NEO_TAG}"; \
+        mkdir /tmp/neo && cd /tmp/neo; \
+        for url in "$igc/intel-igc-core-2_${IGC_VER}_amd64.deb" \
+                   "$igc/intel-igc-opencl-2_${IGC_VER}_amd64.deb" \
+                   "$neo/intel-opencl-icd_${NEO_TAG}-0_amd64.deb" \
+                   "$neo/libigdgmm12_${GMMLIB_VER}_amd64.deb"; do \
+            curl -fsSLO "$url"; \
+        done; \
+        printf '%s\n' \
+            "0a6e64a663ae65a0fa02d6912ae3b6b37cf85b90c21cc423fd9fef70aaf4f628  intel-igc-core-2_${IGC_VER}_amd64.deb" \
+            "779e1b9e88098eb25711e9a8f67c2752665bad22f134aa40ed5649f6e1b87058  intel-igc-opencl-2_${IGC_VER}_amd64.deb" \
+            "61712caaddeba3d38e4f79e2a0fb23fea25596ca2d72c3144c6eea2331ec4301  intel-opencl-icd_${NEO_TAG}-0_amd64.deb" \
+            "6031a63d6e8a12ce61c14efc15f2c8e727061286e3820b8594e6d00615e04d54  libigdgmm12_${GMMLIB_VER}_amd64.deb" \
+            | sha256sum -c -; \
+        apt-get install -y --no-install-recommends /tmp/neo/*.deb; \
+        cd / && rm -rf /tmp/neo; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH \
@@ -51,6 +79,7 @@ RUN python3 -m venv "$VIRTUAL_ENV" \
  && pip install --no-cache-dir -r /tmp/requirements.txt \
  && case "$ACCEL" in \
         edgetpu) pip install --no-cache-dir ai-edge-litert ;; \
+        openvino) pip install --no-cache-dir openvino ;; \
         cpu)     pip install --no-cache-dir onnxruntime ;; \
     esac \
  && rm -f /tmp/requirements.txt
@@ -58,12 +87,16 @@ RUN python3 -m venv "$VIRTUAL_ENV" \
 WORKDIR /app
 COPY piport/ piport/
 COPY scripts/fetch_models.py scripts/fetch_models.py
+COPY scripts/detector_check.py scripts/detector_check.py
 COPY docker/entrypoint.py docker/entrypoint.py
 RUN rm -rf piport/tests piport/__pycache__ \
  && if [ "$ACCEL" != "none" ]; then python3 scripts/fetch_models.py --backend "$ACCEL"; fi
 
 # avclient.py reads this ("none" turns detection off).
 ENV AIPORT_DETECTOR=${ACCEL}
+# OpenVINO's compiled-model cache on the /data volume, so a recreated container skips the
+# GPU compile (detectors/openvino.py; other backends ignore it).
+ENV AIPORT_OV_CACHE_DIR=/data/openvino_cache
 VOLUME /data
 EXPOSE 10001/udp 443/tcp 8090/tcp
 

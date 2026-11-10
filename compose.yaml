@@ -33,6 +33,9 @@ services:
     command: ["--state-dir", "/data"]
     volumes:
       - piport-data:/data
+    # Intel GPU/NPU: build with ACCEL: openvino (both services) and pass the device in.
+    # devices:
+    #   - /dev/dri:/dev/dri
     # volumes:
     #   - ./piport/aiport.cfg:/app/piport/aiport.cfg:ro   # full identity/network surface
 

@@ -7,12 +7,14 @@
            calibration subset) for the .rknn conversion workspace
   edgetpu  Google's SSDLite MobileDet COCO Edge TPU model (the one Frigate ships)
   cpu      the official Ultralytics YOLOv5n ONNX
+  openvino the same YOLOv5n ONNX (OpenVINO reads ONNX directly)
 
 Model binaries are not stored in this repo (see README).
 
   python3 scripts/fetch_models.py                      # rknn assets (default)
   python3 scripts/fetch_models.py --backend edgetpu    # Coral model
   python3 scripts/fetch_models.py --backend cpu        # CPU/Core ML model
+  python3 scripts/fetch_models.py --backend openvino   # Intel GPU/NPU model
   python3 scripts/fetch_models.py --convert            # also build the .rknn (needs rknn-toolkit2, x86)
   python3 scripts/fetch_models.py --no-cpu-model       # RK3588 board: skip yolov5n.onnx
   python3 scripts/fetch_models.py --face-models-only   # YuNet/SFace for face detection (enrich.py)
@@ -59,6 +61,9 @@ BACKEND_MODELS = {
             "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"),
     },
 }
+
+# OpenVINO compiles the cpu backend's ONNX for the Intel GPU/NPU; same file, same pin.
+BACKEND_MODELS["openvino"] = BACKEND_MODELS["cpu"]
 
 # target dirs, keyed by short name
 DIRS = {

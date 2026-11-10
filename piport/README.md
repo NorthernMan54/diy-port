@@ -67,7 +67,7 @@ additions. All of the following was confirmed live against a real console.
 | `http_api.py` | HTTPS `:443`: `/api/1.2/manage`, `/api/1.2/login`, `/api/1.2/status`, `/api/1.2/snapshot`. |
 | `ucp4_client.py` | Generic `ucp4` device-management WebSocket client (adoption, `getInfo`). |
 | `avclient.py` | Classic per-camera avclient client: pairing, detection/classification, `EventSmartDetect` / `EventFeatureFlagsUpdated` pushes, snapshot upload. Most real behavior lives here. |
-| `detectors/` | Pluggable detection backends selected by `[hardware] detector`: `rknn` (RK3588 NPU), `edgetpu` (Coral USB/PCIe), `cpu` (onnxruntime; Core ML on Apple-silicon macOS). `postprocess.py` holds the shared YOLOv5 decode/NMS and COCO → person/vehicle/animal mapping. |
+| `detectors/` | Pluggable detection backends selected by `[hardware] detector`: `rknn` (RK3588 NPU), `edgetpu` (Coral USB/PCIe), `openvino` (Intel iGPU/Arc/NPU), `cpu` (onnxruntime; Core ML on Apple-silicon macOS). `postprocess.py` holds the shared YOLOv5 decode/NMS and COCO → person/vehicle/animal mapping. |
 | `run_all.py` | Launches all of the above together. |
 | `sysinfo_server.py` | Board system monitor / multi-instance web UI (CPU, memory, GPU, NPU); not part of the protocol. |
 | `instance_manager.py` | Manages multiple reboot-surviving emulator instances as systemd units (macvlan or physical). |
@@ -122,7 +122,7 @@ debug = false
 | `[identity] fw_version` / `discovery_fw_version` | Short version over ucp4/avclient/http / longer L2 discovery string. |
 | `[network] mode` | `dhcp` reads the live lease; `static` uses `ip`/`netmask`/`gateway`. `create --ip X.Y.Z.W` or `mode=static` makes `instance_manager.py` use `ip addr add` instead of `dhclient`. |
 | `[network] iface` / `parent_iface` | Blank = auto-detect (default-route interface). |
-| `[hardware] detector` | `auto` (default), `rknn`, `edgetpu`, `cpu` or `none`; `AIPORT_DETECTOR` overrides. |
+| `[hardware] detector` | `auto` (default), `rknn`, `edgetpu`, `openvino`, `cpu` or `none`; `AIPORT_DETECTOR` overrides. |
 | `[hardware] detector_model` | Model file for that backend; blank = its default in `models/` (`AIPORT_MODEL_PATH` overrides). |
 | `[logging] debug` | Debug logs; any `--debug` overrides. |
 
@@ -141,13 +141,13 @@ One-shot installer (packages, venv, deps, model assets, `librknnrt` upgrade, sys
 sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
 ```
 
-Options: `--name NAME`, `--accel auto|rknn|edgetpu|cpu|none` (default `auto`; `--no-npu`
+Options: `--name NAME`, `--accel auto|rknn|edgetpu|openvino|cpu|none` (default `auto`; `--no-npu`
 is an alias for `none`), `--rknn PATH`, `--rknn-url URL` / `--rknn-sha256 HEX`,
 `--webui-port N`. Run as root. The manual equivalent:
 
 ```bash
 pip install -r requirements.txt
-pip install rknn-toolkit-lite2   # or ai-edge-litert (Coral) / onnxruntime (CPU)
+pip install rknn-toolkit-lite2   # or ai-edge-litert (Coral) / openvino (Intel GPU/NPU) / onnxruntime (CPU)
 sudo python3 run_all.py --iface <your-iface> --fallback-host-port <console-ip>:7442
 ```
 
@@ -165,15 +165,17 @@ earlier `sudo` run left owned by root have to be handed back first (install prin
 and the host stats line's GPU and power figures need a sudoers rule for `powermetrics` (in the
 script's header).
 
-## Object detection (NPU / CPU / Core ML / Edge TPU)
+## Object detection (NPU / CPU / Core ML / Edge TPU / OpenVINO)
 
 The pipeline runs a real COCO detector through `piport/detectors/`, chosen at runtime
-by `[hardware] detector` / `AIPORT_DETECTOR` (`auto|rknn|edgetpu|cpu|none`; `auto`
-takes the first backend whose runtime, hardware and model are present):
+by `[hardware] detector` / `AIPORT_DETECTOR` (`auto|rknn|edgetpu|openvino|cpu|none`; `auto`
+takes the first backend whose runtime, hardware and model are present, in that order):
 
 - `rknn` — RK3588 NPU via `rknnlite` (quantized YOLOv5s `.rknn`).
 - `edgetpu` — Coral USB/PCIe via `ai-edge-litert` (SSDLite MobileDet, or a YOLOv5
   Edge TPU export); see below.
+- `openvino` — Intel iGPU / Arc GPU / Core Ultra NPU via `openvino` (the same ONNX models
+  as `cpu`, or an OpenVINO IR `.xml`); see below.
 - `cpu` — `onnxruntime` (Ultralytics `yolov5n.onnx`; also accepts Rockchip's
   `yolov5s_relu.onnx`), on x86_64/arm64 or Core ML on Apple-silicon macOS.
 
@@ -186,6 +188,7 @@ python3 scripts/fetch_models.py                     # rknn assets (also download
 python3 scripts/fetch_models.py --no-cpu-model      # rknn assets without yolov5n.onnx
 python3 scripts/fetch_models.py --backend cpu       # CPU/Core ML model
 python3 scripts/fetch_models.py --backend edgetpu   # Coral MobileDet model
+python3 scripts/fetch_models.py --backend openvino  # Intel GPU/NPU model (= the cpu yolov5n.onnx)
 python3 scripts/fetch_models.py --convert           # build .rknn (x86 host)
 ```
 
@@ -546,6 +549,56 @@ the setup below.
 - **PCIe/M.2 Coral** additionally needs the `gasket`/`apex` kernel driver (and, on a Pi 5, the
   4K-page kernel); not handled by the installer.
 - **No H.264 hardware decode on the Pi 5** (only HEVC), so camera streams are decoded on the CPU.
+
+## Object detection (Intel GPU / NPU, OpenVINO)
+
+`detectors/openvino.py` compiles the `cpu` backend's ONNX model (default `yolov5n.onnx`; any
+Ultralytics YOLOv5, Rockchip raw-head or anchor-free YOLOv8/v9/v11 export, or an OpenVINO IR
+`.xml` + `.bin`) for an Intel GPU or NPU with OpenVINO. The uint8 NHWC -> float NCHW /255
+conversion is folded into the compiled graph, so it runs on the device. `scripts/install.sh
+--accel openvino` does the setup below on x86_64.
+
+- **Device choice.** `AIPORT_OV_DEVICE=auto` (default) takes the first GPU, then an NPU, then the
+  CPU. Any other value is handed to OpenVINO verbatim (`GPU`, `GPU.1`, `NPU`, `CPU`,
+  `AUTO:GPU,CPU`). If the chosen device fails to compile the model, the backend logs the error
+  and falls back to the CPU plugin, so a missing GPU runtime shows up as a log line and slower
+  inference, not lost detection.
+- **`auto` needs a visible device.** `detectors.resolve("auto")` only picks `openvino` when an
+  Intel (`0x8086`) render node `/dev/dri/renderD*` or NPU `/dev/accel/accel*` exists. In a
+  container that means passing `/dev/dri` (and `/dev/accel`) in. `detector = openvino` on a
+  plain CPU still works, on OpenVINO's CPU plugin (a little faster than onnxruntime; see below).
+- **GPU runtime.** OpenVINO's GPU plugin runs on OpenCL, i.e. Intel's compute runtime
+  (`intel-opencl-icd` + IGC + `libigdgmm12`). Ubuntu and Debian bookworm have
+  `intel-opencl-icd` in apt. **Debian trixie (and so the Docker image) does not**: it was
+  dropped before the release. There, the installer and the Dockerfile install Intel's own
+  release debs (compute-runtime `26.35.39758.10`, IGC `v2.41.5`), sha256-pinned. They install
+  cleanly on trixie. `clinfo -l` (or `detector_check.py` reporting `on GPU`) confirms the
+  runtime is working. Old pre-Gen12 iGPUs (before Tiger Lake / Rocket Lake) need Intel's
+  "legacy" 24.35 runtime, which isn't pinned here.
+- **Permissions.** The systemd units and the container run as root. Running it as another user
+  needs membership of the `render` group for `/dev/dri/renderD*`.
+- **NPU.** Core Ultra (Meteor Lake and later) NPUs need the `intel_vpu` kernel driver (Linux
+  6.3+) and Intel's user-space driver from
+  [intel/linux-npu-driver](https://github.com/intel/linux-npu-driver) (Level Zero). The
+  installer doesn't set these up. The NPU wants static shapes, so a dynamic-input model is
+  pinned to 640x640 (for every device). Untested here.
+- **Compile cache.** A GPU compile takes ~2 s (Iris Xe, yolov5n). The compiled blob is cached in
+  `AIPORT_OV_CACHE_DIR` (default `models/openvino_cache`; the Docker image uses
+  `/data/openvino_cache` so it survives container recreation; blank disables), and a cached
+  load takes ~0.2 s.
+- **Measured** on an i5-1240P (Iris Xe iGPU, OpenVINO 2026.4.1, yolov5n 640x640):
+  `detect()` ~13 ms/frame on the GPU, ~27 ms on OpenVINO's CPU plugin, ~33 ms for the `cpu`
+  (onnxruntime) backend. The GPU numbers match bare metal and in the Docker image. Detections on Rockchip's `bus.jpg` matched the `cpu` backend's to within a
+  pixel.
+
+Quick check after setup (exits non-zero if no person is found):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/airockchip/rknn_model_zoo/v2.3.2/examples/yolov5/model/bus.jpg
+python3 scripts/detector_check.py --backend openvino --image bus.jpg --expect person
+# Docker: docker run --rm --device /dev/dri -v "$PWD/bus.jpg:/bus.jpg:ro" --entrypoint python3 \
+#   piport-openvino scripts/detector_check.py --image /bus.jpg --expect person
+```
 
 ## ONVIF cameras (`onvif_push.py`)
 

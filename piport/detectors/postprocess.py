@@ -215,6 +215,16 @@ def layout(output_shapes, num_classes):
     return "raw_heads"
 
 
+def decode(mode, outputs, anchors, input_size):
+    """Decode float32 model outputs per layout() `mode` into (boxes, classes, scores)
+    in input_size pixel space -- shared by the ONNX-graph backends (cpu, openvino)."""
+    if mode == "ultralytics":
+        return post_process_ultralytics(outputs[0])
+    if mode == "anchor_free":
+        return post_process_anchor_free(outputs[0])
+    return post_process_raw_heads(outputs, anchors, (input_size, input_size))
+
+
 def resize(frame_rgb, size):
     """Resize an HxWx3 frame to size x size: OpenCV's area filter when present, else
     nearest-neighbour in numpy (no hard OpenCV dependency)."""
