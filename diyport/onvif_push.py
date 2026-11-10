@@ -93,6 +93,25 @@ def parse_camera_list(value):
     return {_camera_id(d) for d in value.split(",") if d.strip()}
 
 
+# AIPORT_ONVIF_CAMERA_TIMESTAMPS (a camera list: empty or 0 for none, 1 for all, or device IDs):
+# copy those cameras' own frame timestamps instead of stamping each frame with the moment it
+# arrived (-use_wallclock_as_timestamps). Arrival stamps carry every bit of network and
+# RTSP-over-TCP jitter into the video Protect plays: live 2026-11-10, a 33 fps go2rtc restream
+# with timestamps exactly 30 ms apart came out of the copy pull with 12% of frames stamped
+# 0-5 ms after the one before and 8% 60-115 ms after it, and Protect's live view froze and its
+# burnt-in clock jumped; with the camera's timestamps every gap was 30-31 ms. Arrival stamps
+# stay the default for cameras whose own timestamps can't be trusted.
+CAMERA_TIMESTAMPS = parse_camera_list(os.environ.get("AIPORT_ONVIF_CAMERA_TIMESTAMPS"))
+
+
+def use_camera_timestamps(device_ids, setting=None):
+    """Whether a pull feeding these cameras keeps the camera's timestamps."""
+    setting = CAMERA_TIMESTAMPS if setting is None else setting
+    if setting is True:
+        return True
+    return bool(setting) and any(_camera_id(d) in setting for d in device_ids)
+
+
 def parse_modes(value):
     """AIPORT_ONVIF_MODE, "<default>[,<deviceID>=<mode>...]" -> (default, {deviceID: mode}). A bad
     entry is logged and left out, so that camera gets the default."""
@@ -439,7 +458,8 @@ def parse_destination(dest):
     return parts.hostname, parts.port, retry, timeout
 
 
-def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True):
+def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True,
+                    wallclock=True):
     """Camera video copied (no re-encode) plus an audio track into FLV on stdout.
     Protect's ingest only marks a stream ready (live view, recording) with both
     tracks present -- the extendedFlv header always flags audio+video -- so a
@@ -448,12 +468,13 @@ def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy
     The camera's audio is copied (FLV carries G.711 and AAC as they are), as
     unifi-cam-proxy runs here with -c:a copy. Re-encoding G.711 to AAC made
     Protect's live view stop and start every second (live 2026-10-28);
-    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus)."""
+    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus).
+    `wallclock=False` keeps the camera's timestamps (see CAMERA_TIMESTAMPS)."""
     cmd = [
         ffmpeg_bin, "-nostdin", "-loglevel", "error",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts+discardcorrupt",
-        "-use_wallclock_as_timestamps", "1", "-timeout", "15000000",
-        "-rtsp_transport", "tcp", "-i", source_url,
+    ] + (["-use_wallclock_as_timestamps", "1"] if wallclock else []) + [
+        "-timeout", "15000000", "-rtsp_transport", "tcp", "-i", source_url,
     ]
     aac = ["-c:a", "aac", "-ar", "32000", "-ac", "1", "-b:a", "32k"]
     if camera_audio:
@@ -659,6 +680,15 @@ class SharedPull:
                 break
         log.info("pull %s stopped", _describe(self.source_url))
 
+    def _command(self):
+        """(ffmpeg command, whether it keeps the camera's timestamps) for this pull's cameras.
+        The streamName is set per push (set_stream_name), not here."""
+        with self._lock:
+            devices = {s.device_id for s in self._sinks}
+        camera_ts = use_camera_timestamps(devices)
+        return ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport", self.camera_audio,
+                               self._copy_audio, wallclock=not camera_ts), camera_ts
+
     def _pull_once(self, attempt):
         proc = None
         stderr_tail = lambda: ""
@@ -666,16 +696,15 @@ class SharedPull:
         self._last_video = None
         codec_error = None
         try:
-            # The streamName is set per push (set_stream_name), not here.
-            cmd = ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport",
-                                  self.camera_audio, self._copy_audio)
+            cmd, camera_ts = self._command()
             proc = self._proc = subprocess.Popen(cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             stderr_tail = start_stderr_drain(proc)
             with self._lock:
                 names = ", ".join(sorted(f"{s.device_id}/{s.channel}" for s in self._sinks))
-            log.info("pull %s started for %s (attempt %d, pid %d)",
-                     _describe(self.source_url), names or "no push", attempt, proc.pid)
+            log.info("pull %s started for %s (attempt %d, pid %d%s)",
+                     _describe(self.source_url), names or "no push", attempt, proc.pid,
+                     ", camera timestamps" if camera_ts else "")
             self._consume(proc.stdout.read)
             reason = "ffmpeg output ended"
         except _AudioNotCopyable as exc:
