@@ -1242,6 +1242,13 @@ class FlvPush:
             reason = repr(exc)
         finally:
             if self._sock:
+                try:
+                    # shutdown() first: on Linux, close() alone doesn't end the connection
+                    # while drain_socket's thread is blocked in recv() on it (up to the 30 s
+                    # timeout), so Protect keeps a half-open push. macOS wakes the recv.
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 self._sock.close()
                 self._sock = None
         if not self._stop.is_set():
