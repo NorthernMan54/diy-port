@@ -3552,6 +3552,7 @@ class EnrichFromFrameTest(unittest.TestCase):
         gone = av._follow_parent(dict(face), [{"coord": [800, 800, 50, 50]}])
         self.assertEqual(gone["coord"], [110, 100, 20, 20])
 
+    @unittest.skipUnless(_CV2, "OpenCV not installed (encodes the test JPEG)")
     def test_reads_frame_jpeg_then_reuses_within_interval(self):
         import cv2
         import numpy as np
