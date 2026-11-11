@@ -177,6 +177,23 @@ class TestDestination(unittest.TestCase):
         self.assertTrue(camera_ts)
         self.assertNotIn("-use_wallclock_as_timestamps", cmd)
 
+    def test_pool_pull_knows_its_camera_before_any_push_subscribes(self):
+        # PullPool starts a SharedPull before the FlvPush subscribes, and the pull builds its
+        # first ffmpeg command at once: the camera must already be known then (live
+        # 2026-11-10, the setting was ignored because the first command saw no pushes).
+        pool = onvif_push.PullPool()
+        with mock.patch.object(onvif_push.SharedPull, "start", lambda self: self), \
+                mock.patch.object(onvif_push, "CAMERA_TIMESTAMPS", {"0298568A6465"}):
+            pull = pool.acquire("rtsp://cam/101", False, "video1", device_id="0298568A6465")
+            self.assertEqual(pull._sinks, {})
+            cmd, camera_ts = pull._command()
+            self.assertTrue(camera_ts)
+            self.assertNotIn("-use_wallclock_as_timestamps", cmd)
+            other = pool.acquire("rtsp://cam/202", False, "video1", device_id="AABBCCDDEEFF")
+            self.assertFalse(other._command()[1])
+            self.assertIs(pool.acquire("rtsp://cam/101", False, "video3",
+                                       device_id="0298568A6465"), pull)
+
     def test_ffmpeg_cmd_silent_track_without_camera_audio(self):
         cmd = onvif_push.ffmpeg_push_cmd("ffmpeg", "rtsp://cam/1", "ABC", camera_audio=False)
         self.assertIn("anullsrc=r=32000:cl=mono", cmd)

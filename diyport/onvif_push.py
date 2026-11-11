@@ -631,6 +631,9 @@ class SharedPull:
         self.source_url = source_url
         self.camera_audio = camera_audio
         self.ffmpeg_bin = ffmpeg_bin
+        # The cameras this pull serves, set by PullPool.acquire before start(): the first
+        # ffmpeg command is built before any push has subscribed.
+        self.device_ids = set()
         self._lock = threading.Lock()
         self._sinks = {}       # FlvPush -> waiting for a key frame to (re)join
         self._header = None
@@ -684,7 +687,7 @@ class SharedPull:
         """(ffmpeg command, whether it keeps the camera's timestamps) for this pull's cameras.
         The streamName is set per push (set_stream_name), not here."""
         with self._lock:
-            devices = {s.device_id for s in self._sinks}
+            devices = set(self.device_ids) | {s.device_id for s in self._sinks}
         camera_ts = use_camera_timestamps(devices)
         return ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport", self.camera_audio,
                                self._copy_audio, wallclock=not camera_ts), camera_ts
@@ -1103,14 +1106,18 @@ class PullPool:
         self._lock = threading.Lock()
         self._pulls = {}  # key -> [SharedPull or TranscodePull, users]
 
-    def acquire(self, url, camera_audio, channel=None, renditions=None):
+    def acquire(self, url, camera_audio, channel=None, renditions=None, device_id=None):
         with self._lock:
             key = (url, camera_audio) if renditions is None else (url, camera_audio, renditions)
             entry = self._pulls.get(key)
             if entry is None:
                 pull = (SharedPull(url, camera_audio, self.ffmpeg_bin) if renditions is None
                         else TranscodePull(url, camera_audio, renditions))
+                if device_id and renditions is None:
+                    pull.device_ids.add(device_id)  # before start(): its first command needs it
                 entry = self._pulls[key] = [pull.start(), 0]
+            elif device_id and renditions is None:
+                entry[0].device_ids.add(device_id)
             entry[1] += 1
             return entry[0] if renditions is None else entry[0].outputs[channel]
 
@@ -1161,7 +1168,7 @@ class FlvPush:
 
     def start(self):
         self._pull = self._pool.acquire(self.source_url, self.camera_audio, self.channel,
-                                        self.renditions)
+                                        self.renditions, device_id=self.device_id)
         self._pull.subscribe(self)
         self._thread.start()
         return self
