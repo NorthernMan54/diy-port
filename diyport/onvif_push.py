@@ -95,6 +95,19 @@ def parse_camera_list(value):
     return {_camera_id(d) for d in value.split(",") if d.strip()}
 
 
+# AIPORT_ONVIF_CAMERA_TIMESTAMPS (camera list, as AIPORT_ONVIF_AUDIO_OFF): keep those cameras'
+# own frame timestamps instead of arrival stamps, which carry network jitter into the video.
+CAMERA_TIMESTAMPS = parse_camera_list(os.environ.get("AIPORT_ONVIF_CAMERA_TIMESTAMPS"))
+
+
+def use_camera_timestamps(device_ids, setting=None):
+    """Whether a pull feeding these cameras keeps the camera's timestamps."""
+    setting = CAMERA_TIMESTAMPS if setting is None else setting
+    if setting is True:
+        return True
+    return bool(setting) and any(_camera_id(d) in setting for d in device_ids)
+
+
 def parse_modes(value):
     """AIPORT_ONVIF_MODE, "<default>[,<deviceID>=<mode>...]" -> (default, {deviceID: mode}). A bad
     entry is logged and left out, so that camera gets the default."""
@@ -448,7 +461,8 @@ def parse_destination(dest):
     return parts.hostname, parts.port, retry, timeout
 
 
-def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True):
+def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True,
+                    wallclock=True):
     """Camera video copied (no re-encode) plus an audio track into FLV on stdout.
     Protect's ingest only marks a stream ready (live view, recording) with both
     tracks present -- the extendedFlv header always flags audio+video -- so a
@@ -457,12 +471,13 @@ def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy
     The camera's audio is copied (FLV carries G.711 and AAC as they are), as
     unifi-cam-proxy runs here with -c:a copy. Re-encoding G.711 to AAC made
     Protect's live view stop and start every second (live 2026-10-28);
-    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus)."""
+    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus).
+    `wallclock=False` keeps the camera's timestamps (see CAMERA_TIMESTAMPS)."""
     cmd = [
         ffmpeg_bin, "-nostdin", "-loglevel", "error",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts+discardcorrupt",
-        "-use_wallclock_as_timestamps", "1", "-timeout", "15000000",
-        "-rtsp_transport", "tcp", "-i", source_url,
+    ] + (["-use_wallclock_as_timestamps", "1"] if wallclock else []) + [
+        "-timeout", "15000000", "-rtsp_transport", "tcp", "-i", source_url,
     ]
     aac = ["-c:a", "aac", "-ar", "32000", "-ac", "1", "-b:a", "32k"]
     if camera_audio:
@@ -619,6 +634,9 @@ class SharedPull:
         self.source_url = source_url
         self.camera_audio = camera_audio
         self.ffmpeg_bin = ffmpeg_bin
+        # The cameras this pull serves, set by PullPool.acquire before start(): the first
+        # ffmpeg command is built before any push has subscribed.
+        self.device_ids = set()
         self._lock = threading.Lock()
         self._sinks = {}       # FlvPush -> waiting for a key frame to (re)join
         self._header = None
@@ -669,6 +687,15 @@ class SharedPull:
                 break
         log.info("pull %s stopped", _describe(self.source_url))
 
+    def _command(self):
+        """(ffmpeg command, whether it keeps the camera's timestamps) for this pull's cameras.
+        The streamName is set per push (set_stream_name), not here."""
+        with self._lock:
+            devices = set(self.device_ids) | {s.device_id for s in self._sinks}
+        camera_ts = use_camera_timestamps(devices)
+        return ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport", self.camera_audio,
+                               self._copy_audio, wallclock=not camera_ts), camera_ts
+
     def _pull_once(self, attempt):
         proc = None
         stderr_tail = lambda: ""
@@ -676,16 +703,15 @@ class SharedPull:
         self._last_video = None
         codec_error = None
         try:
-            # The streamName is set per push (set_stream_name), not here.
-            cmd = ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport",
-                                  self.camera_audio, self._copy_audio)
+            cmd, camera_ts = self._command()
             proc = self._proc = subprocess.Popen(cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             stderr_tail = start_stderr_drain(proc)
             with self._lock:
                 names = ", ".join(sorted(f"{s.device_id}/{s.channel}" for s in self._sinks))
-            log.info("pull %s started for %s (attempt %d, pid %d)",
-                     _describe(self.source_url), names or "no push", attempt, proc.pid)
+            log.info("pull %s started for %s (attempt %d, pid %d%s)",
+                     _describe(self.source_url), names or "no push", attempt, proc.pid,
+                     ", camera timestamps" if camera_ts else "")
             self._consume(proc.stdout.read)
             reason = "ffmpeg output ended"
         except _AudioNotCopyable as exc:
@@ -1170,14 +1196,18 @@ class PullPool:
         self._lock = threading.Lock()
         self._pulls = {}  # key -> [SharedPull or TranscodePull, users]
 
-    def acquire(self, url, camera_audio, channel=None, renditions=None):
+    def acquire(self, url, camera_audio, channel=None, renditions=None, device_id=None):
         with self._lock:
             key = (url, camera_audio) if renditions is None else (url, camera_audio, renditions)
             entry = self._pulls.get(key)
             if entry is None:
                 pull = (SharedPull(url, camera_audio, self.ffmpeg_bin) if renditions is None
                         else TranscodePull(url, camera_audio, renditions))
+                if device_id and renditions is None:
+                    pull.device_ids.add(device_id)  # before start(): its first command needs it
                 entry = self._pulls[key] = [pull.start(), 0]
+            elif device_id and renditions is None:
+                entry[0].device_ids.add(device_id)
             entry[1] += 1
             return entry[0] if renditions is None else entry[0].outputs[channel]
 
@@ -1228,7 +1258,7 @@ class FlvPush:
 
     def start(self):
         self._pull = self._pool.acquire(self.source_url, self.camera_audio, self.channel,
-                                        self.renditions)
+                                        self.renditions, device_id=self.device_id)
         self._pull.subscribe(self)
         self._thread.start()
         return self
