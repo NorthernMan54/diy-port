@@ -100,6 +100,7 @@ as `extendedFlv`, while the AI Port also pulls the camera's RTSP for detection.
 | `motion.py`, `regions.py`, `stationary.py`, `norfair_match.py` | Frigate-derived motion gate, region crops, parked-object check, Norfair matching |
 | `replay.py` | Offline clip replay and scenario checks |
 | `onvif_push.py` | ONVIF camera video push to Protect (`extendedFlv`) |
+| `onvif_media.py` | ONVIF camera's media profiles (substream for `video3`) |
 | `sysinfo_server.py` | Dev-box CPU/mem/GPU/NPU/Coral status page (`webui.html`) |
 | `instance_manager.py`, `run_all.py` | Multi-instance orchestration |
 
@@ -189,6 +190,7 @@ diyport/               the emulator
   hoststats.py / camera_clock.py / apple_fm.py   host load, RTSP clock, macOS vehicle model
   apple/                Swift helper for the macOS vehicle model
   onvif_push.py         ONVIF camera video push (extendedFlv)
+  onvif_media.py        ONVIF camera media profiles (substream lookup)
   sysinfo_server.py     dev-box CPU/mem/GPU/NPU/Coral status page (+ webui.html)
   models/               anchors + COCO labels (model binaries fetched, not stored)
   tests/                unit suite
@@ -445,13 +447,72 @@ sudo python3 diyport/instance_manager.py destroy lab2
 Assigning a third-party (ONVIF) camera to the AI Port hands that camera's video
 ingest to the AI Port: Protect sends the camera's RTSP URL (`OnvifStreamControl`)
 and asks for each channel to be pushed to `tcp://<console>:7550` in Ubiquiti's
-`extendedFlv` format (`ChangeVideoSettings`). `diyport/onvif_push.py` does that
-with one `ffmpeg -c:v copy` per channel (no re-encode), and the AI Port runs
-detection on the camera's stream like on a UniFi camera's.
+`extendedFlv` format (`ChangeVideoSettings`). `diyport/onvif_push.py` does that,
+and the AI Port runs detection on the camera's stream like on a UniFi camera's.
+
+There are three ways to run this video, set by `AIPORT_ONVIF_MODE`: a default, then any
+per-camera exceptions by device ID (MAC), such as `isolated,AABBCCDDEEFF=copy`.
+
+| Mode | What it does | Pushes run in | Camera sessions | Sizes sent to Protect |
+|---|---|---|---|---|
+| `copy` (default) | `ffmpeg` copies the camera's main stream and substream | `avclient.py` | 3, with detection | The camera's own |
+| `transcode` | One `gst-launch` decodes the main stream once and encodes each channel with VideoToolbox, as the real AI Port does | `avclient.py` | 2, with detection | `video1` main size at 4000 kbps, `video2` substream size at 2000 kbps, `video3` 360 lines at 500 kbps |
+| `isolated` | As `transcode` | A process per camera | 2, with detection | As `transcode` |
+
+`transcode` and `isolated` need macOS and `brew install gstreamer`. On an M1 Pro a transcoded
+camera used about 11% of one core and up to about 290 MB, against about 1% and 11 MB for
+`copy`. On a machine without them, the camera logs an error and uses `copy`.
+
+In `isolated`, a crash in the push costs that camera's video for a few seconds and leaves
+detection running, and the process is replaced. It doesn't help the other way round: if
+detection's process dies, the push stops with it.
+
+Protect doesn't always tell diy-port it was removed: it just closes each connection without
+a message. An adopted instance logs `was this AI Port removed in Protect?` once this has
+gone on for `AIPORT_REFUSED_WARN_S` seconds (default 180, `0` turns this off). It doesn't
+clear the adoption itself, since a console problem could look the same.
+
+The video and detection restart separately: each has its own camera pull, so losing
+one leaves the other running. A transcoded camera's pipeline is replaced when a channel
+has produced no video for `AIPORT_ONVIF_STALL_S` seconds (default 30, `0` turns this
+off). A settings re-send from Protect reconnects only that channel's push, unless a
+channel has been silent for 5 s. In every mode, the log warns
+`restream: no video to Protect` when a channel has delivered nothing for
+`AIPORT_STREAM_STALL_S` seconds.
+
+`AIPORT_ONVIF_AUDIO_OFF` (empty or `0` for none, `1` for all, or a list of device IDs) is an experiment: the listed cameras' replies tell
+Protect audio is off, while their pushes keep the audio track.
+
+If the camera's ONVIF profiles can't be read, diy-port tries again: twice within a few
+seconds, then every 30 s, 2 minutes and 10 minutes. Until it succeeds, `video2` and
+`video3` use the main stream.
 
 Verified on a Raspberry Pi 5 (Docker, Coral) with a Hikvision 4K camera and
 Protect 7.2: live view in the app and browser, recording, and smart-detect
 events.
+
+Tested with audio (2026-10-30), on a MacBook Pro (M1 Pro, macOS 27.0.1, native,
+ffmpeg 8.0.1) as an AI Port X, Protect 7.3.70 on a UCG-Max: browser live view
+plays video and audio smoothly on High and Low. The test camera, a Hikvision
+ECI-T24F2, was set up as follows:
+
+| Setting | Main stream (`video1`) | Sub-stream (`video2`/`video3`) |
+|---|---|---|
+| Video Type | Video and Audio Stream | Video and Audio Stream |
+| Resolution | 2560×1440 | 1280×720 |
+| Bit Rate Type | Variable | Variable |
+| Picture Quality | Medium | Medium |
+| Frame Rate | 20 fps | 20 fps |
+| Max. Bit Rate | 3072 kbps | 2048 kbps |
+| Video Encoding | H.264 | H.264 |
+| H.264+ | Off | – |
+| Profile | Medium | Medium |
+| I-Frame Interval | 20 (1 s) | 20 (1 s) |
+| Smoothing | 50 | 25 |
+| Audio Encoding | AAC, 16 kHz (shared by both streams) | |
+
+The camera's audio should be AAC or G.711: ffmpeg can't copy G.722.1, G.726, PCM
+or MP2 into FLV, and the pull then fails.
 
 Limits:
 
@@ -463,12 +524,23 @@ Limits:
   retried every second. Set the camera's stream to H.264. UniFi's own HEVC
   framing (FLV codec id 8 with a `0x68 0x01` VPS/SPS/PPS tag) is not
   implemented; such a stream is now refused with one clear error.
-- Every channel carries the camera's main stream (no lower-resolution
-  channels); the resolution reported to Protect is probed from the stream.
-- Audio is AAC 32 kHz mono (silent if the camera has none). Protect asks for
-  Opus, which plain FLV cannot carry.
-- Each channel and the detector open their own RTSP session to the camera; some
-  cameras limit concurrent logins (Hikvision answers `401` past its limit).
+- `video1` carries the camera's main stream; `video2` and `video3` (UniFi's
+  medium and low channels) carry its substream when the camera's ONVIF Media
+  service lists a smaller H.264 profile (looked up with the RTSP URL's login;
+  otherwise the main stream). The resolution
+  reported to Protect is probed from the main stream, and the substream's is its
+  ONVIF profile's.
+- The camera's audio is copied as it is (G.711, AAC or MP3), like unifi-cam-proxy
+  with `-c:a copy`: re-encoding G.711 to AAC made live view stop and start every
+  second. Other audio (e.g. Opus) is re-encoded to AAC 32 kHz mono, and a camera
+  without audio gets a silent AAC track. Protect asks for Opus, which plain FLV
+  cannot carry. **Audio does not play in Protect yet:** G.711 is accepted but
+  Protect's browser player has no audio, and the camera's AAC plays in stutters.
+- Channels carrying the same stream share one RTSP session (one ffmpeg, fanned
+  out); the detector opens its own. With a substream that is three sessions:
+  main (`video1`), sub (`video2`/`video3`) and detection. Cameras limit
+  concurrent sessions: a Hikvision answers `500` to RTSP SETUP past three, or
+  `401` past its login limit.
 - On a Pi 5 the camera's H.264 is decoded in software for detection (~half a
   core for 4K at 12 fps).
 
@@ -542,7 +614,7 @@ Detector/runtime environment overrides: `AIPORT_DETECTOR`, `AIPORT_MODEL_PATH`,
 `AIPORT_OBJ_THRESH`, `AIPORT_HWDEC`, `AIPORT_HW_SCALE`, `AIPORT_FRAME_JPEG_FPS`,
 `AIPORT_ORT_INTRA_THREADS`, `AIPORT_ORT_PROVIDER`, `AIPORT_OV_DEVICE`, `AIPORT_OV_CACHE_DIR`,
 `AIPORT_TICK_S`, `AIPORT_DETECT_FPS`,
-`AIPORT_CONFIRM_MS`, `AIPORT_MISS_S`, `AIPORT_TRUE_THRESH`, `AIPORT_RESUME_S`,
+`AIPORT_CONFIRM_MS`, `AIPORT_MISS_S`, `AIPORT_TRUE_THRESH`, `AIPORT_CROSS_TYPE_IOU`, `AIPORT_CROSS_TYPE_TRACK_SCORE`, `AIPORT_RESUME_S`,
 `AIPORT_MIN_INITIALIZED`, `AIPORT_BOX_DELAY_MS`, `AIPORT_MOTION_GATE` /
 `AIPORT_MOTION_THRESHOLD` / `AIPORT_MOTION_CONTOUR_AREA` / `AIPORT_MOTION_GATE_THRESH`,
 `AIPORT_REGIONS` / `AIPORT_DETECT_SIZE`, `AIPORT_TRACKER`, `AIPORT_LENS_FILTER` /

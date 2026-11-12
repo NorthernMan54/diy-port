@@ -7,7 +7,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 USER_HOME="$(eval echo "~${SUDO_USER:-$USER}")"
-STATE_DIR="${DIYPORT_STATE_DIR:-$USER_HOME/.diyport-state}"
+. "$(dirname "$0")/diyport_paths.sh"   # DIYPORT_INSTANCE picks the instance; "native" if not set
+STATE_DIR="${DIYPORT_STATE_DIR:-$DEFAULT_STATE_DIR}"
 
 usage() {
     echo "usage: $0 export <bundle.tgz> [--iface IFACE] [--state-dir DIR] | import <bundle.tgz>" >&2

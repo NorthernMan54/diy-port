@@ -24,6 +24,13 @@ SHAPE = (720, 1280, 3)
 
 
 class TestRegions(unittest.TestCase):
+    def test_iou_xywh(self):
+        # The one [x, y, w, h] IoU avclient and replay share.
+        self.assertAlmostEqual(regions.iou_xywh([0, 0, 10, 10], [5, 0, 10, 10]), 50 / 150)
+        self.assertEqual(regions.iou_xywh([0, 0, 10, 10], [10, 0, 10, 10]), 0.0)  # touching
+        self.assertEqual(regions.iou_xywh([0, 0, 0, 0], [0, 0, 0, 0]), 0.0)
+        self.assertIs(av._iou, regions.iou_xywh)
+
     def test_region_is_square_and_at_least_the_model_size(self):
         x1, y1, x2, y2 = regions.calculate_region(SHAPE, 600, 300, 640, 400, 320)
         self.assertEqual((x2 - x1, y2 - y1), (320, 320))

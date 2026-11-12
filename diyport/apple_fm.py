@@ -13,10 +13,12 @@ The model runs in the logged-in user's session, so when diy-port runs as root (s
 helper is started as that user (launchctl asuser + sudo -u). The helper is built with
 swiftc from apple/vehicle_attrs.swift into apple/build/ on first use.
 """
+import atexit
 import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE = os.path.join(HERE, "apple", "vehicle_attrs.swift")
 BUILD_DIR = os.path.join(HERE, "apple", "build")
 REQUEST_TIMEOUT_S = 20.0
+STOP_WAIT_S = 2.0   # per step of _stop: EOF, then TERM, then KILL to the helper's session
 
 # Protect's vehicleType vocabulary (enrich.VEHICLE_TYPES' targets plus suv and van).
 TYPE_WORDS = {
@@ -109,6 +112,7 @@ class VehicleClassifier:
         self._lock = threading.Lock()
         self._proc = None
         self.available = None   # None until first use; then True/False for good
+        atexit.register(self._stop)
 
     def _start(self):
         if not _build(self.binary):
@@ -117,7 +121,8 @@ class VehicleClassifier:
         try:
             self._proc = subprocess.Popen(
                 _as_session_user([self.binary]), stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                start_new_session=True)
             first = self._readline(REQUEST_TIMEOUT_S)
         except OSError as exc:
             first = "unavailable: %s" % exc
@@ -142,12 +147,29 @@ class VehicleClassifier:
         return out[0].strip()
 
     def _stop(self):
-        if self._proc is not None:
+        """Close stdin (the helper exits on EOF and sudo reaps it), then signal its own
+        session. Live 2026-11-11 on Flynn: five `sudo -u ... vehicle_attrs` wrappers, one per
+        restart back to 6 days, each holding a zombie helper. The service's SIGINT to diy-port's
+        process group reached sudo, which then never reaped its child; and kill() here
+        SIGKILLed sudo, orphaning the helper. Its own session keeps group signals off it."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        for sig in (None, signal.SIGTERM, signal.SIGKILL):
+            if sig is not None:
+                try:
+                    os.killpg(proc.pid, sig)
+                except OSError:
+                    pass
             try:
-                self._proc.kill()
-            except OSError:
+                proc.wait(STOP_WAIT_S)
+                return
+            except subprocess.TimeoutExpired:
                 pass
-            self._proc = None
 
     def classify(self, image_path):
         """(vehicle type or None, colour or None, ms) for a crop file, or None when the

@@ -172,21 +172,25 @@ real camera to it from the camera's own settings.
 
 On macOS, `scripts/macos_launchd.sh install` runs it as a launchd agent under your own account
 (no sudo: macOS lets any user bind ports below 1024). It starts at login and is restarted if it
-exits, from settings in `~/.diyport.env` (`scripts/diyport.env.example`); `touch ~/.diyport-restart`
-(or `scripts/macos_launchd.sh restart`) picks up a code or settings change. Output goes to
-`~/diyport.log`, rotated at `DIYPORT_LOG_MAX_MB` (50) with `DIYPORT_LOG_KEEP` (5) old files kept.
-`scripts/diyport_service.sh` is what the agent runs, and can also be run in a terminal. Files an
-earlier `sudo` run left owned by root have to be handed back first (install prints the `chown`).
-The host stats line's GPU and power figures need `powermetrics` as root:
+exits. Each instance keeps its files in `~/.diy-port/<instance>/` (`DIYPORT_INSTANCE`, `native`
+when not set): settings in `diyport.env` (`scripts/diyport.env.example`), `state/`, and
+`logs/diyport.log`, rotated at `DIYPORT_LOG_MAX_MB` (50) with `DIYPORT_LOG_KEEP` (5) old files
+kept. Touching its `restart` file (or `scripts/macos_launchd.sh restart`) picks up a code or
+settings change. The first `native` install moves the old `~/.diyport.env`, `~/.diyport-state`
+and `~/diyport.log` there. `scripts/diyport_service.sh` is what the agent runs, and can also be
+run in a terminal. Files an earlier `sudo` run left owned by root have to be handed back first
+(install prints the `chown`), and the host stats line's GPU and power figures need a sudoers
+rule for `powermetrics` (in the script's header).
 
-```bash
-echo "$USER ALL=(root) NOPASSWD: /usr/bin/powermetrics" | sudo tee /etc/sudoers.d/diyport-powermetrics
-sudo chmod 440 /etc/sudoers.d/diyport-powermetrics
-sudo visudo -cf /etc/sudoers.d/diyport-powermetrics
-```
-
-`scripts/macos_move_host.sh export|import` moves an adopted AI Port to another Mac with its
-identity; pin the same MAC on the new host with `--mac`.
+A second instance can run beside it on its own address, MAC and device ID. One that pulls
+ONVIF cameras straight from the LAN has to be a root daemon, because macOS's Local Network
+privacy blocks an agent from LAN devices other than the gateway:
+`sudo DIYPORT_INSTANCE=onvif scripts/macos_launchd.sh install --daemon`, with `DIYPORT_BIND_IP`
+and `AIPORT_ADVERTISE_IP` set in `~/.diy-port/onvif/diyport.env`. It adds that address to the
+interface at every start, so the alias comes back after a reboot. Once a root daemon holds a specific
+address's :443, macOS refuses a user agent the wildcard :443 (`Address already in use`, even
+with `SO_REUSEPORT`), so on a Mac with a daemon every instance runs as one, each with its own
+`DIYPORT_BIND_IP` (the main instance on the interface's own address).
 
 ## Object detection (NPU / CPU / Core ML / Edge TPU / OpenVINO)
 
@@ -316,7 +320,9 @@ Knobs: `AIPORT_VEHICLE_ATTRS` / `AIPORT_LPR` / `AIPORT_FACE` (`auto`|`0`|`1`),
 `AIPORT_FACE_MATCH_MIN_PX` (40, the face's shorter side: smaller faces are too small to match
 and get no `faceEmbed`; a face track is still tracked from its small reads but is reported only
 once a read reaches the minimum, with its thumbnail and embedding from those reads. A face that
-stays small is never reported; its person still is), `AIPORT_FACE_EMBED_MIN_PX` (60: a
+stays small is never reported; its person still is), `AIPORT_ENRICH_INTERVAL_S` (0.25: plate
+and face reads use the analysed frame's own full-res JPEG at most this often, and between reads
+a face box moves with its person), `AIPORT_FACE_EMBED_MIN_PX` (60: a
 smaller read is still matched against Protect's face DB here, but its `faceEmbed` isn't sent;
 unnamed, Protect would run its own looser search on it, which put 43-48 px reads on the wrong
 person), `AIPORT_FACE_EMBED_MIN_NORM` (7.0: a read whose SFace vector is shorter than this,
@@ -386,6 +392,17 @@ median, for tuning the threshold per type. A face or plate confirms as soon as a
 person or vehicle is there, since it's only looked for inside that box and only once per
 snapshot.
 
+**One object, two labels.** Per-class NMS keeps a person box and an animal box drawn on the
+same person, and the animal box could confirm and join the event as an animal (seen live on a
+person walking up a drive, IoU ~0.6). An animal box overlapping a person box in the same
+frame, or a person track seen within the last second, by `AIPORT_CROSS_TYPE_IOU` (default
+0.5; 0 turns this off) is taken as that person. A track only claims it once confirmed or
+scoring at least `AIPORT_CROSS_TYPE_TRACK_SCORE` (default 0.8): a weak, unconfirmed person
+track on a cat otherwise turned its animal reads into person and confirmed itself. The person always wins: letting the score or
+an animal track decide, a replay of two people crossing boxed the second person as an animal
+at 0.9 and gave every later box of theirs to the animal. A dog beside its walker overlaps far
+less. Vehicles are left out: a rider on a motorcycle overlaps it as much, and both count.
+
 **Resuming tracks.** A track that closed within `AIPORT_RESUME_S` (default 60 s) is picked
 up again by a same-type detection overlapping its last or first box (IoU >= 0.4): it rejoins
 its event if that is still open, and a vehicle that never moved (centre within a quarter of
@@ -440,6 +457,13 @@ Protect's relay and our decode. `AIPORT_BOX_DELAY_MS` back-dates every such time
 residual: `"500"` for all cameras, or with per-camera overrides, e.g.
 `"300,02000000000B=800"` (a proxied camera has an extra hop). Default 0. Tune it by comparing a
 box's time with the video in playback.
+
+**ONVIF shared decode** (`AIPORT_ONVIF_SHARED_DECODE`, transcode and isolated modes, on by
+default; `0` turns it off). Detection decodes the video1 this instance pushes to Protect instead of pulling the
+camera itself, and each frame carries the wall time Protect places it at, so boxes line up
+with no `AIPORT_BOX_DELAY_MS` (set it to 0 for these cameras). Without it, boxes led the
+video by about 1.9 s in isolated mode, by an amount that moved with load. It also saves one
+camera session per camera, at about the same CPU.
 
 A track only joins an event once it confirms (Protect's `eventStartMSec`, 1 s), so a car that
 crosses the road in a second used to get its first box as it left. A track keeps its box from
@@ -643,7 +667,26 @@ RTSP URL, `streaming` true/false) and, per channel, `ChangeVideoSettings` with a
 `extendedFlv` `avSerializer`: a `streamName` and `tcp://<console>:7550` as destination.
 Protect's own ingest for that camera stops; without the push the camera has no video.
 
-Each channel is `ffmpeg -c:v copy` (plus AAC audio) into FLV, rewritten by
+`OnvifStreamControl` names only the main profile. `onvif_media.py` asks the camera's
+ONVIF Media service (GetCapabilities, GetProfiles, GetStreamUri, WS-Security digest
+with the RTSP URL's login) for the rest, once per URL, and `video2`/`video3` carry the
+smallest H.264 profile below the main one's resolution (a UniFi camera's medium and
+low channels are 720p and 360p; `video2` on the main stream made grids and the app
+pull full resolution); until that answer they wait, so they don't open a main-stream
+session only to restart on the substream. `video1`, and detection, use the main stream.
+
+Channels on the same stream share one ffmpeg (`SharedPull`, kept per URL by
+`PullPool`): a camera allows few RTSP sessions, and a Hikvision answered `500` to a
+fourth. Each push (`FlvPush`) joins at the next key frame with ffmpeg's
+`onMetaData` (its own `streamName` patched in) and the AVC/AAC config tags, its
+timestamps rebased to that frame; one that falls ~10 s behind or loses its socket
+rejoins at a later key frame. The pull restarts ffmpeg (backing off while it gets
+no frames) as long as a push uses it.
+
+Each channel is `ffmpeg -c:v copy -c:a copy` into FLV (audio FLV or Protect can't
+take -- any sound format but MP3, G.711 or AAC -- is re-encoded to AAC; a camera
+without audio gets a silent AAC track; known issue: no audio plays in Protect
+yet -- G.711 gives none in the browser, AAC stutters), rewritten by
 `rewrite_flv()` and sent over TCP. **H.264 only:** an HEVC source is muxed by
 ffmpeg as Enhanced RTMP (an `hvc1` FourCC), which `ms` refuses (live view resets,
 the push is closed after a few hundred bytes); `rewrite_flv()` raises

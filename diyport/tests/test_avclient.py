@@ -102,6 +102,51 @@ class TestGeometry(unittest.TestCase):
         self.assertFalse(av._segment_crosses_line((900, 100), (900, 900), (0, 500), (100, 500)))
 
 
+class TestEventFaceResume(unittest.TestCase):
+    """A face back in an open event continues the nearest face track that closed in it."""
+    EVENT = {"id": 7}
+
+    def face(self, coord, emb=None, event_id=7, **kw):
+        tr = {"objectType": "face", "coord": coord, "event_id": event_id, "extra": {}}
+        if emb is not None:
+            tr["extra"]["faceEmbed"] = emb
+        tr["extra"].update(kw)
+        return tr
+
+    def read(self, coord, emb=None):
+        d = {"objectType": "face", "coord": coord, "score": 0.9}
+        if emb is not None:
+            d["scored"] = {"faceEmbed": (emb, 0.9)}
+        return d
+
+    def test_moved_face_continues_the_nearest_closed_face(self):
+        dev = {"recent": [(5, self.face([100, 100, 40, 40]), 0),
+                          (9, self.face([600, 300, 40, 40]), 0)]}
+        tid, _tr, how = av._resume_recent(dev, self.read([500, 320, 45, 45]), self.EVENT)
+        self.assertEqual((tid, how), (9, "event"))
+        self.assertEqual([r[0] for r in dev["recent"]], [5])
+
+    def test_other_event_or_no_event_opens_a_new_track(self):
+        dev = {"recent": [(5, self.face([100, 100, 40, 40], event_id=6), 0)]}
+        self.assertIsNone(av._resume_recent(dev, self.read([400, 100, 40, 40]), self.EVENT))
+        self.assertIsNone(av._resume_recent(dev, self.read([400, 100, 40, 40]), None))
+
+    def test_a_different_person_by_embedding_is_skipped(self):
+        dev = {"recent": [(5, self.face([100, 100, 40, 40], emb=[1.0, 0.0]), 0),
+                          (9, self.face([900, 100, 40, 40], emb=[0.6, 0.8]), 0)]}
+        tid, _tr, _how = av._resume_recent(dev, self.read([200, 100, 40, 40], emb=[0.0, 1.0]),
+                                           self.EVENT)
+        self.assertEqual(tid, 9)
+
+    def test_named_face_needs_an_embedding_that_agrees(self):
+        named = self.face([100, 100, 40, 40], emb=[1.0, 0.0], matchedId=196, matchedName="A")
+        dev = {"recent": [(5, named, 0)]}
+        self.assertIsNone(av._resume_recent(dev, self.read([300, 100, 40, 40]), self.EVENT))
+        tid, _tr, _how = av._resume_recent(dev, self.read([300, 100, 40, 40], emb=[0.9, 0.1]),
+                                           self.EVENT)
+        self.assertEqual(tid, 5)
+
+
 class TestLateDetector(Base):
     """A detector that loads after the pull started takes a different input size: its
     detect() resizes the frame, so detection doesn't stop (upstream 256ff57)."""
@@ -147,6 +192,15 @@ class TestParsers(Base):
         self.assertEqual(polys[0], [(0, 0), (10, 0), (10, 10), (0, 10)])
         self.assertEqual(av._parse_zones(None), [])
         self.assertEqual(av._parse_zone_map(field), {"1": [(0, 0), (10, 0), (10, 10), (0, 10)]})
+
+    def test_zone_lists_stay_aligned_past_a_bad_entry(self):
+        # A non-dict entry used to be skipped only by the map, so ids/types could
+        # crash or fall out of step with the polygons.
+        field = {"1": "junk", "2": {"coord": [0, 0, 10, 0, 10, 10], "objectTypes": ["person"]},
+                 "3": {"coord": [1, 1, 5, 1, 5, 5]}}
+        self.assertEqual(av._parse_zone_ids(field), [2, 3])
+        self.assertEqual(av._parse_zone_types(field), [["person"], None])
+        self.assertEqual(len(av._parse_zones(field)), 2)
 
     def test_zone_id_follows_controller_key(self):
         field = {"7": {"coord": [0, 0, 1000, 0, 1000, 1000, 0, 1000]}}
@@ -584,6 +638,23 @@ class TestCameraEvent(Base):
                   if tr["objectType"] == "person"]
         self.assertEqual(len(people), 1)
 
+    def test_person_also_boxed_as_animal_stays_a_person(self):
+        # Live 19:02 on Driveway: a person, also boxed "animal" on a few frames (IoU ~0.6),
+        # joined the event as an animal too.
+        walk = [[569 - 10 * i, 419, 166, 560] for i in range(8)]
+        for i, coord in enumerate(walk):
+            objs = [dict(self.PERSON, coord=coord)]
+            if 2 <= i <= 5:
+                objs.append({"objectType": "animal", "score": 0.82,
+                             "coord": [coord[0] + 24, 460, 189, 524]})
+                if i % 2:
+                    objs.pop(0)          # some frames: only the animal box
+            self.tick(*objs)
+        types = {tr["objectType"] for tr in av._motion_state["D"]["tracks"].values()}
+        self.assertEqual(types, {"person"})
+        self.assertNotIn("animal", [d["objectType"] for fn, p in self.sent
+                                    if fn == "EventSmartDetect" for d in p["descriptors"]])
+
     def test_size_ref_is_the_median_of_recent_boxes(self):
         tr = {"coord": [526, 109, 34, 55], "sizes": [(32, 124), (31, 122), (34, 120), (34, 55)]}
         self.assertEqual(av._size_ref(tr)[2:], [33.0, 121.0])
@@ -884,7 +955,7 @@ class TestCameraEvent(Base):
             self.tick()
         ev = self.events()
         # Multi-participant leave: no descriptors, a snapshot per participant.
-        self.assertEqual(ev[-1], ("leave", [], ["face", "person"]))
+        self.assertEqual(ev[-1], ("leave", ["face", "person"], ["face", "person"]))
         self.assertEqual([e[0] for e in ev[:-1]], ["moving"] * (len(ev) - 1))
         self.assertIsNone(av._motion_state["D"].get("event"))
 
@@ -917,7 +988,7 @@ class TestCameraEvent(Base):
         self.assertEqual(self.events(), [("enter", ["face", "person"], [])])
         for _ in range(av.MOTION_MISS_TOLERANCE_TICKS):
             self.tick(self.CAR)
-        self.assertEqual(self.events()[-1], ("leave", [], ["face", "person"]))
+        self.assertEqual(self.events()[-1], ("leave", ["face", "person"], ["face", "person"]))
 
     def _clock(self, start=0):
         clock = [start]
@@ -1304,7 +1375,75 @@ class TestCameraEvent(Base):
         ev = self.events()
         self.assertEqual(ev[0][0], "enter")
         self.assertNotIn("vehicle", ev[0][1])   # the car stayed parked
-        self.assertEqual(ev[-1], ("leave", [], ["face", "person"]))  # closed without the time limit
+        self.assertEqual(ev[-1], ("leave", ["face", "person"], ["face", "person"]))  # closed without the time limit
+
+    def test_person_standing_still_parks_and_closes_the_event(self):
+        # Live 10:42 on the ONVIF Driveway: people standing in the driveway held the event
+        # open to its 5-minute limit, and a car passing on the road at 10:44 joined it, shown
+        # in Protect at 10:42 with a person's thumbnail.
+        for _ in range(av.STILL_TICKS + 3):
+            self.tick(self.PERSON, self.FACE)
+        ev = self.events()
+        self.assertEqual(ev[0], ("enter", ["face", "person"], []))
+        self.assertEqual(ev[-1], ("leave", ["face", "person"], ["face", "person"]))
+        self.assertIsNone(av._motion_state["D"].get("event"))
+        tracks = av._motion_state["D"]["tracks"].values()
+        self.assertTrue(all(tr.get("stationary_coord") for tr in tracks))
+
+    def test_object_that_never_joined_is_not_in_the_leave(self):
+        # Live 11:57 on both Driveways: a car on the far road, outside every zone listing
+        # vehicles, closed while a person's event was open and went into its leave, so the
+        # person's event was listed (at 30%) as a vehicle detection too.
+        car = dict(self.CAR, in_zone=False)
+        for _ in range(3):
+            self.tick(self.PERSON, self.FACE, car)
+        for _ in range(av.MOTION_MISS_TOLERANCE_TICKS + 1):
+            self.tick(self.PERSON, self.FACE)          # the car is gone
+        for _ in range(av.MOTION_MISS_TOLERANCE_TICKS + 1):
+            self.tick()
+        ev = self.events()
+        self.assertEqual(ev[0], ("enter", ["face", "person"], []))
+        self.assertEqual(ev[-1], ("leave", ["face", "person"], ["face", "person"]))
+
+    def test_parked_face_of_a_parked_person_does_not_rejoin(self):
+        # Live 15:43 on Driveway faces parked since 12:36 and 12:39 took a passing face at
+        # their spot and rejoined, each a face of its own in Protect.
+        from unittest import mock
+        for _ in range(av.STILL_TICKS + 3):
+            self.tick(self.PERSON, self.FACE)
+        tracks = av._motion_state["D"]["tracks"]
+        old = {tid for tid, tr in tracks.items() if tr["objectType"] == "face"}
+        with mock.patch.object(av, "_moved_since", lambda tr: tr["objectType"] == "face"), \
+                mock.patch.object(av, "_parked_spot_unchanged", return_value=False):
+            self.tick(self.PERSON, self.FACE)
+        faces = {tid for tid, tr in tracks.items() if tr["objectType"] == "face"}
+        self.assertTrue(faces)
+        self.assertFalse(faces & old)
+        self.assertTrue(all(tracks[t].get("stationary_coord") for t in tracks
+                            if tracks[t]["objectType"] == "person"))
+
+    def test_parked_face_rejoins_with_its_moving_person(self):
+        from unittest import mock
+        for _ in range(av.STILL_TICKS + 3):
+            self.tick(self.PERSON, self.FACE)
+        tracks = av._motion_state["D"]["tracks"]
+        old = {tid for tid, tr in tracks.items() if tr["objectType"] == "face"}
+        with mock.patch.object(av, "_moved_since", return_value=True), \
+                mock.patch.object(av, "_parked_spot_unchanged", return_value=False):
+            self.tick(self.PERSON, self.FACE)
+        self.assertEqual({tid for tid, tr in tracks.items() if tr["objectType"] == "face"}, old)
+
+    def test_car_passing_a_parked_person_gets_its_own_event(self):
+        for _ in range(av.STILL_TICKS + 3):
+            self.tick(self.PERSON, self.FACE)
+        self.sent.clear()
+        for _ in range(3):
+            self.tick(self.PERSON, self.FACE, self.CAR)
+        for _ in range(av.MOTION_MISS_TOLERANCE_TICKS):
+            self.tick(self.PERSON, self.FACE)
+        ev = self.events()
+        self.assertEqual(ev[0], ("enter", ["vehicle"], []))
+        self.assertEqual(ev[-1], ("leave", ["vehicle"], ["vehicle"]))
 
     def test_single_participant_keeps_proven_leave(self):
         av._event_max_ms["D"] = 0
@@ -1390,11 +1529,15 @@ class TestCameraEvent(Base):
         self.tick(self.PERSON)
         for _ in range(av.STILL_TICKS):
             self.tick(self.PERSON)
-        d = self.sent[-1][1]["descriptors"][0]
+        # A still person parks (PARK_WHEN_STILL_IN_EVENT): the event closes, and the leave
+        # reports them stationary since they stopped.
+        fn, p = self.sent[-1]
+        self.assertEqual((fn, p["edgeType"]), ("EventSmartDetect", "leave"), self.sent[-1])
+        d = p["descriptors"][0]
         self.assertEqual((d["objectType"], d["stationary"]), ("person", True))
         tr = av._motion_state["D"]["tracks"][1]
         self.assertEqual(d["idleSinceTimeMs"], tr["still_since_ms"])
-        self.assertIsNotNone(av._motion_state["D"].get("event"))  # people are not parked
+        self.assertIsNone(av._motion_state["D"].get("event"))
 
     def test_jitter_still_counts_as_still(self):
         tr = {"coord": [100, 100, 200, 200]}
@@ -1656,11 +1799,20 @@ class TestMultiLeave(Base):
     def test_payload_shape(self):
         self.send().cancel()
         payload = self.sent[-1][1]
-        self.assertEqual((payload["edgeType"], payload["descriptors"], payload["objectTypes"]),
-                         ("leave", [], []))
+        self.assertEqual((payload["edgeType"], payload["objectTypes"]), ("leave", []))
         self.assertEqual([(x["trackerID"], x["smartDetectSnapshotType"])
                           for x in payload["smartDetectSnapshots"]],
                          [(3, "person"), (1, "vehicle"), (4, "face")])
+        # Each participant's final descriptor too, at its snapshot's score and box: with
+        # none, Protect showed multi-participant events at 30%.
+        self.assertEqual([(d["trackerID"], d["objectType"], d["confidenceLevel"], d["coord"])
+                          for d in payload["descriptors"]],
+                         [(x["trackerID"], x["smartDetectSnapshotType"], x["confidenceLevel"],
+                           x["coord"]) for x in payload["smartDetectSnapshots"]])
+        with mock.patch.object(av, "MULTI_LEAVE_DESCRIPTORS", False):
+            self.sent.clear()
+            self.send()
+            self.assertEqual(self.sent[-1][1]["descriptors"], [])
         attrs = payload["trackerIDAttrMap"]
         self.assertEqual(attrs["3"]["associatedFaceTrackerID"], 4)
         self.assertEqual(attrs["4"]["faceEmbed"], [0.1, 0.2])
@@ -2340,13 +2492,92 @@ class TestDetectionDedupe(Base):
         ]
         self.assertEqual(len(av._dedupe_detections(dets)), 2)
 
-    def test_different_types_not_merged(self):
-        # A person box overlapping an animal box is genuinely two objects.
+    def test_vehicle_and_person_not_merged(self):
+        # A rider on a motorcycle: both count.
         dets = [
-            {"objectType": "person", "score": 0.67, "coord": [100, 100, 200, 400]},
-            {"objectType": "animal", "score": 0.51, "coord": [110, 110, 195, 390]},
+            {"objectType": "vehicle", "score": 0.67, "coord": [100, 100, 200, 400]},
+            {"objectType": "person", "score": 0.51, "coord": [110, 110, 195, 390]},
         ]
         self.assertEqual(len(av._dedupe_detections(dets)), 2)
+
+    def test_person_and_animal_kept_apart(self):
+        # The pre-tracking dedupe is per type; _animal_on_person settles such a pair.
+        dets = [
+            {"objectType": "animal", "score": 0.82, "coord": [593, 460, 189, 524]},
+            {"objectType": "person", "score": 0.57, "coord": [569, 419, 166, 560]},
+        ]
+        self.assertEqual(len(av._dedupe_detections(dets)), 2)
+
+
+class TestAnimalOnPerson(Base):
+    # Live 19:02 on Driveway: one person, boxed as person and as animal.
+    PERSON = [569, 419, 166, 560]
+    ANIMAL = [593, 460, 189, 524]
+
+    def tracks(self, seen_ms=1000, object_type="person", confirmed=True, score=0.75):
+        return {7: {"objectType": object_type, "coord": list(self.PERSON), "seen_ms": seen_ms,
+                    "confirmed": confirmed, "score": score}}
+
+    def types(self, out):
+        return sorted(d["objectType"] for d in out)
+
+    def test_higher_scoring_animal_box_on_a_person_box_is_the_person(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)},
+                {"objectType": "person", "score": 0.57, "coord": list(self.PERSON)},
+                {"objectType": "face", "score": 0.9, "coord": [600, 430, 40, 50]}]
+        out = av._animal_on_person({}, dets, 1200)
+        self.assertEqual(self.types(out), ["face", "person"])
+        self.assertEqual([d["score"] for d in out if d["objectType"] == "person"], [0.82])
+
+    def test_animal_box_over_a_person_track_is_the_person(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        self.assertEqual(self.types(av._animal_on_person(self.tracks(), dets, 1200)), ["person"])
+
+    def test_weak_unconfirmed_person_track_takes_no_animal(self):
+        # Live 2026-11-12 06:25 on Driveway: a cat confirmed as a person at 0.71.
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(confirmed=False, score=0.71), dets, 1200)
+        self.assertEqual(self.types(out), ["animal"])
+
+    def test_strong_unconfirmed_person_track_still_takes_it(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(confirmed=False, score=0.85), dets, 1200)
+        self.assertEqual(self.types(out), ["person"])
+
+    def test_relabel_is_logged_at_info(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        with self.assertLogs(av.log, "INFO") as cm:
+            av._animal_on_person(self.tracks(), dets, 1200)
+        self.assertIn("taken as the person", cm.output[0])
+
+    def test_person_box_over_an_animal_track_stays_a_person(self):
+        # Replay 13:33 on Driveway: the second person, boxed "animal" at 0.9 first, took every
+        # person box after it while an animal track could claim them.
+        dets = [{"objectType": "person", "score": 0.6, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(object_type="animal"), dets, 1200)
+        self.assertEqual(self.types(out), ["person"])
+
+    def test_an_old_person_track_takes_nothing(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(seen_ms=0), dets, 5000)
+        self.assertEqual(self.types(out), ["animal"])
+
+    def test_dog_beside_its_walker_stays_an_animal(self):
+        dets = [{"objectType": "person", "score": 0.9, "coord": [400, 300, 150, 600]},
+                {"objectType": "animal", "score": 0.8, "coord": [480, 750, 150, 120]}]
+        self.assertEqual(self.types(av._animal_on_person({}, dets, 1200)), ["animal", "person"])
+
+    def test_vehicles_left_alone(self):
+        dets = [{"objectType": "vehicle", "score": 0.8, "coord": list(self.ANIMAL)},
+                {"objectType": "person", "score": 0.6, "coord": list(self.PERSON)}]
+        self.assertEqual(self.types(av._animal_on_person({}, dets, 1200)), ["person", "vehicle"])
+
+    def test_off(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)},
+                {"objectType": "person", "score": 0.57, "coord": list(self.PERSON)}]
+        with mock.patch.object(av, "CROSS_TYPE_IOU", 0):
+            out = av._animal_on_person(self.tracks(), dets, 1200)
+        self.assertEqual(self.types(out), ["animal", "person"])
 
 
 class TestMotionLoopLifecycle(Base):
@@ -2698,6 +2929,249 @@ class TestStreamControlUsedPoints(unittest.TestCase):
         self.assertEqual(reply["usedPoints"], 4)
 
 
+class TestOnvifChannelGeometry(unittest.TestCase):
+    """The ChangeVideoSettings reply sizes each ONVIF channel by what it carries:
+    the main stream, or the camera's substream on video2/video3."""
+
+    def setUp(self):
+        import onvif_push
+        patcher = mock.patch.object(onvif_push, "FlvPush")
+        patcher.start().return_value.start.return_value = mock.Mock()
+        self.addCleanup(patcher.stop)
+        self.profiles = []
+        m = onvif_push.PushManager(fetch_profiles=lambda url: self.profiles, background=False)
+        saved = av._onvif
+        av._onvif = m
+        self.addCleanup(lambda: setattr(av, "_onvif", saved))
+
+    def _reply(self):
+        dest = {"avSerializer": {"type": "extendedFlv", "parameters": {"streamName": "S"},
+                                 "destinations": ["tcp://10.0.0.1:7550"]}}
+        ws = _FakeWS()
+        av.handle_function(ws, {"functionName": "ChangeVideoSettings", "messageId": "m",
+                                "payload": {"deviceID": "CAMX", "video": {
+                                    "video1": dest, "video2": dest, "video3": dest}}}, {})
+        return json.loads(ws.sent[-1])["payload"]["video"]
+
+    def test_video2_and_video3_report_substream(self):
+        self.profiles = [
+            {"token": "P1", "encoding": "H264", "width": 2560, "height": 1440, "fps": 20,
+             "url": "rtsp://cam/101"},
+            {"token": "P2", "encoding": "H264", "width": 640, "height": 360, "fps": 15,
+             "url": "rtsp://cam/102"}]
+        av._onvif.set_source("CAMX", "rtsp://cam/101", width=2560, height=1440, fps=20)
+        video = self._reply()
+        self.assertEqual((video["video1"]["width"], video["video1"]["height"]), (2560, 1440))
+        for channel in ("video2", "video3"):
+            self.assertEqual((video[channel]["width"], video[channel]["height"],
+                              video[channel]["fps"]), (640, 360, 15))
+
+    def test_main_stream_everywhere_without_substream(self):
+        av._onvif.set_source("CAMX", "rtsp://cam/101", width=2560, height=1440, fps=20)
+        video = self._reply()
+        self.assertEqual(video["video1"], video["video2"])
+        self.assertEqual(video["video1"], video["video3"])
+
+    def _reply_audio(self):
+        dest = {"avSerializer": {"type": "extendedFlv", "parameters": {"streamName": "S"},
+                                 "destinations": ["tcp://10.0.0.1:7550"]}}
+        ws = _FakeWS()
+        av.handle_function(ws, {"functionName": "ChangeVideoSettings", "messageId": "m",
+                                "payload": {"deviceID": "CAMX", "video": {"video1": dest}}}, {})
+        return json.loads(ws.sent[-1])["payload"]["audio"]
+
+    def test_audio_is_reported_on_unless_the_camera_is_listed(self):
+        av._onvif.set_source("CAMX", "rtsp://cam/101", width=2560, height=1440, fps=20)
+        self.assertEqual(self._reply_audio(), {"enabled": True, "volume": 100})
+        with mock.patch.object(av, "_ONVIF_AUDIO_OFF", {"OTHER"}):
+            self.assertTrue(self._reply_audio()["enabled"])
+        with mock.patch.object(av, "_ONVIF_AUDIO_OFF", {"CAMX"}):
+            self.assertEqual(self._reply_audio(), {"enabled": False, "volume": 100})
+        with mock.patch.object(av, "_ONVIF_AUDIO_OFF", True):
+            self.assertFalse(self._reply_audio()["enabled"])
+
+    def test_transcode_reports_what_each_encoder_makes(self):
+        # Live 2026-11-04 09:20: video2 encoded at 2000 kbps, reported at 1000000.
+        import onvif_push
+        self.profiles = [
+            {"token": "P1", "encoding": "H264", "width": 2560, "height": 1440, "fps": 20,
+             "url": "rtsp://cam/101"},
+            {"token": "P2", "encoding": "H264", "width": 1280, "height": 720, "fps": 20,
+             "url": "rtsp://cam/102"}]
+        with mock.patch.multiple(onvif_push, MODES=("transcode", {}),
+                                 transcode_available=lambda: True):
+            av._onvif.set_source("CAMX", "rtsp://cam/101", width=2560, height=1440, fps=20)
+            video = self._reply()
+        got = {c: (v["width"], v["height"], v["fps"], v["bitrate"]) for c, v in video.items()}
+        self.assertEqual(got, {"video1": (2560, 1440, 20, 4000000),
+                               "video2": (1280, 720, 20, 2000000),
+                               "video3": (640, 360, 20, 500000)})
+
+    def test_transcode_size_beats_a_different_probe_in_the_reply(self):
+        import onvif_push
+        av._stream_probe["CAMX"] = {"width": 1920, "height": 1080, "fps": 15}
+        self.addCleanup(lambda: av._stream_probe.pop("CAMX", None))
+        with mock.patch.multiple(onvif_push, MODES=("transcode", {}),
+                                 transcode_available=lambda: True):
+            av._onvif.set_source("CAMX", "rtsp://cam/101", width=2560, height=1440, fps=20)
+            video = self._reply()
+        self.assertEqual((video["video1"]["width"], video["video1"]["height"]), (2560, 1440))
+
+    def _start_camera(self, start_stream):
+        ws = _FakeWS()
+        with mock.patch.object(av, "_start_stream", side_effect=start_stream), \
+                mock.patch.object(av, "_start_motion_detector"), \
+                mock.patch.object(av, "_start_status_watch"):
+            av.handle_function(ws, {"functionName": "OnvifStreamControl", "messageId": "m",
+                                    "payload": {"deviceID": "CAMX", "streaming": True,
+                                                "streamUrl": "rtsp://cam/101", "width": 2560,
+                                                "height": 1440, "fps": 20}}, {})
+        self.addCleanup(lambda: (av._stream_probe.pop("CAMX", None),
+                                 av._stream_points.pop("CAMX", None),
+                                 av._stream_started_at.pop("CAMX", None)))
+        return av._onvif.source("CAMX")
+
+    def test_camera_is_encoded_at_its_probed_size(self):
+        # The encoder and the reply must agree, and the reply prefers what's really there.
+        def probed(*a, **k):
+            av._stream_probe["CAMX"] = {"width": 1920, "height": 1080}
+        src = self._start_camera(probed)
+        self.assertEqual((src["width"], src["height"], src["fps"]), (1920, 1080, 20))
+
+    def test_failed_probe_keeps_the_size_already_set(self):
+        # A change of size would restart the pipeline.
+        av._onvif.set_source("CAMX", "rtsp://cam/101", width=1920, height=1080, fps=20)
+        src = self._start_camera(lambda *a, **k: av._stream_probe.pop("CAMX", None))
+        self.assertEqual((src["width"], src["height"]), (1920, 1080))
+
+    def test_first_failed_probe_uses_the_announced_size(self):
+        src = self._start_camera(lambda *a, **k: None)
+        self.assertEqual((src["width"], src["height"]), (2560, 1440))
+
+    def test_video_is_set_up_when_detection_fails_to_start(self):
+        src = self._start_camera(OSError("no ffmpeg"))
+        self.assertEqual(src["url"], "rtsp://cam/101")
+
+
+class TestRefusalWatch(unittest.TestCase):
+    """Protect hanging up on an adopted AI Port says nothing, so diy-port has to notice.
+    Live 2026-11-02 19:30: 699 closes in a row, each a generic ConnectionClosedError."""
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.watch = av._RefusalWatch(180, clock=lambda: self.now[0])
+
+    def _refused(self, closes=1, step=5.0, adopted=True):
+        for _ in range(closes):
+            self.watch.connected()
+            self.watch.ended(adopted)
+            self.now[0] += step
+
+    def test_warns_once_after_the_threshold_and_names_the_file(self):
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(36)           # 175 s
+        with self.assertLogs(av.log, "WARNING") as logs:
+            self._refused()             # 180 s
+        self.assertIn("removed in Protect", logs.output[0])
+        self.assertIn(av.ADOPT_STATE_FILE, logs.output[0])
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(50)
+
+    def test_a_reconnect_that_settles_does_not_warn(self):
+        # Live 2026-11-03 09:37: 16 closes over 78 s, then Protect answered.
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(16)
+            self.watch.connected()
+            self.watch.heard()
+            self.watch.ended(True)
+            self._refused(36)
+
+    def test_says_when_protect_answers_again_and_can_warn_again(self):
+        with self.assertLogs(av.log, "WARNING"):
+            self._refused(40)
+        self.watch.connected()
+        with self.assertLogs(av.log, "INFO") as logs:
+            self.watch.heard()
+        self.assertIn("answering", logs.output[0])
+        self.watch.ended(True)
+        with self.assertLogs(av.log, "WARNING"):
+            self._refused(40)
+
+    def test_before_adoption_closes_are_normal(self):
+        # Live 2026-11-02: 26 closes until adoption at 20:37.
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(100, adopted=False)
+
+    def test_a_console_that_is_down_restarts_the_count(self):
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(30)
+            self.watch.ended(True)      # never opened: nothing is listening
+            self.now[0] += 600
+            self._refused(30)
+
+    def test_can_be_turned_off(self):
+        self.watch.warn_s = 0
+        with self.assertNoLogs(av.log, "WARNING"):
+            self._refused(100)
+
+    def _run(self, frames, watch):
+        ws = mock.MagicMock(subprotocol=None)
+        ws.__iter__.return_value = iter(frames)
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = ws
+        info = {k: "x" for k in ("mac_nosep", "ip", "sysid_hex", "type", "version", "device_id",
+                                 "guid")}
+        self.addCleanup(setattr, av, "_status_ws", av._status_ws)
+        with mock.patch.object(av, "connect", return_value=conn), \
+                mock.patch.object(av, "build_ssl_context"), \
+                mock.patch.object(av, "send_msg"), \
+                mock.patch.object(av, "_refusals", watch):
+            av.run("console", 7442, info)
+
+    def test_run_tells_the_watch_what_happened(self):
+        self._run([], self.watch)
+        self.assertTrue(self.watch._open)
+        self.assertFalse(self.watch._heard)
+        frame = json.dumps({"inResponseTo": "1", "payload": {}})
+        self._run([frame], self.watch)
+        self.assertTrue(self.watch._heard)
+
+
+class TestRestreamHealth(unittest.TestCase):
+    """A restream that stops is logged on its own: _camera_health only sees detection."""
+
+    def setUp(self):
+        saved = av._onvif
+        av._onvif = mock.Mock()
+        av._onvif.has_source.return_value = True
+        self.addCleanup(lambda: setattr(av, "_onvif", saved))
+        self.addCleanup(av._restream_stalled.clear)
+
+    def _check(self, stalled):
+        av._onvif.stalled_channels.return_value = stalled
+        av._check_restream()
+
+    def test_warns_once_then_on_change_then_says_it_recovered(self):
+        with self.assertLogs(av.log, "WARNING") as logs:
+            self._check({"CAM": ["video1"]})
+        self.assertIn("no video to Protect on video1", logs.output[0])
+        with self.assertNoLogs(av.log, "INFO"):
+            self._check({"CAM": ["video1"]})
+        with self.assertLogs(av.log, "WARNING") as logs:
+            self._check({"CAM": ["video1", "video3"]})
+        self.assertIn("video1, video3", logs.output[0])
+        with self.assertLogs(av.log, "INFO") as logs:
+            self._check({})
+        self.assertIn("video to Protect again", logs.output[0])
+
+    def test_a_stopped_camera_is_not_called_recovered(self):
+        self._check({"CAM": ["video1"]})
+        av._onvif.has_source.return_value = False
+        with self.assertNoLogs(av.log, "INFO"):
+            self._check({})
+        self.assertEqual(av._restream_stalled, {})
+
+
 class _FakeWS:
     def __init__(self):
         self.sent = []
@@ -2743,6 +3217,25 @@ class HwDecoderSelection(unittest.TestCase):
         self.assertEqual(av._hwdec_args("h264"), [])
         self.assertEqual(av._hwdec_args(None), [])
         self.assertEqual(av._hwdec_args("mjpeg"), [])
+
+    def test_videotoolbox_h264_from_the_camera_itself(self):
+        # An ONVIF camera is pulled directly, not through Protect's relay.
+        os.environ["AIPORT_HWDEC"] = "videotoolbox"
+        self.assertEqual(av._hwdec_args("h264", direct=True), ["-hwaccel", "videotoolbox"])
+        self.assertEqual(av._hwdec_args(None, direct=True), ["-hwaccel", "videotoolbox"])
+        self.assertEqual(av._hwdec_args("hevc", direct=True), ["-hwaccel", "videotoolbox"])
+        self.assertEqual(av._hwdec_args("mjpeg", direct=True), [])
+        os.environ["AIPORT_HWDEC"] = "rkmpp"
+        self.assertEqual(av._hwdec_args("h264", direct=True), ["-c:v", "h264_rkmpp"])
+
+    def test_direct_h264_pull_stays_on_the_gpu(self):
+        os.environ["AIPORT_HWDEC"] = "videotoolbox"
+        with mock.patch.object(av, "HW_SCALE", True), \
+                mock.patch.object(av.sys, "platform", "darwin"):
+            pre, _, hw, _ = av._pull_video_args("h264", 1280, 720, "CAM", direct=True)
+            self.assertEqual(hw, "vt")
+            self.assertIn("videotoolbox_vld", pre)
+            self.assertEqual(av._pull_video_args("h264", 1280, 720, "CAM")[2], "vt_upload")
 
     def test_auto_on_macos_is_videotoolbox(self):
         os.environ.pop("AIPORT_HWDEC", None)
@@ -3222,3 +3715,31 @@ class TestStopAllStreams(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnrichFromFrameTest(unittest.TestCase):
+    """Face reads from the analysed frame's JPEG; between reads a face follows its person."""
+
+    def setUp(self):
+        av._enrich_cache.clear()
+        av._enrich_last_read.clear()
+
+    def test_face_follows_person_between_reads(self):
+        face = {"objectType": "face", "coord": [110, 100, 20, 20],
+                "parent_coord": [100, 100, 50, 150]}
+        moved = av._follow_parent(dict(face), [{"coord": [130, 110, 50, 150]}])
+        self.assertEqual(moved["coord"], [140, 110, 20, 20])
+        self.assertEqual(moved["parent_coord"], [130, 110, 50, 150])
+        gone = av._follow_parent(dict(face), [{"coord": [800, 800, 50, 50]}])
+        self.assertEqual(gone["coord"], [110, 100, 20, 20])
+
+    def test_reads_frame_jpeg_then_reuses_within_interval(self):
+        import cv2
+        import numpy as np
+        jpeg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
+        dets = [{"objectType": "person", "coord": [0, 0, 10, 10], "frame": (7, jpeg)}]
+        img, key, source = av._enrich_image("CAM", dets)
+        self.assertEqual((key, source), (("frame", 7), (7, jpeg)))
+        self.assertEqual(img.shape, (8, 8, 3))
+        av._enrich_cache["CAM"] = (key, [])
+        self.assertEqual(av._enrich_image("CAM", dets)[:2], (True, ("frame", 7)))

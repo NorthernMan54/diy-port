@@ -46,10 +46,14 @@ log = logging.getLogger("aiport-avclient")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import envutil
 import apple_fm
 import enrich
 import hoststats
 import onvif_push
+import shared_decode
+import onvif_restream
+import regions
 from procutil import start_stderr_drain
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +87,12 @@ _HWDEC_BACKENDS = {
     "rkmpp": {"h264": ["-c:v", "h264_rkmpp"], "hevc": ["-c:v", "hevc_rkmpp"]},
     "v4l2m2m": {"h264": ["-c:v", "h264_v4l2m2m"], "hevc": ["-c:v", "hevc_v4l2m2m"]},
     "videotoolbox": {"hevc": ["-hwaccel", "videotoolbox"]},
+}
+# Codecs hardware-decoded only when pulled straight from the camera (an ONVIF camera), not
+# through Protect's relay. A 2560x1440 Hikvision's H.264 (driveway clips, 2026-10-28) decoded
+# with 0 errors either way, VideoToolbox at ~1.4% of a core vs ~7.3% in software.
+_HWDEC_DIRECT = {
+    "videotoolbox": {"h264": ["-hwaccel", "videotoolbox"]},
 }
 _FFPROBE_BIN = os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe") \
     if FFMPEG_BIN != "ffmpeg" and os.path.exists(os.path.join(os.path.dirname(FFMPEG_BIN), "ffprobe")) \
@@ -152,7 +162,7 @@ def _probe_stream(url, timeout=8):
 
 # An RTSP pull ffmpeg gives up on after this long with no data, so a dead relay connection
 # exits and is restarted (live 17:28 a pull sat 70 min on one, at 0% CPU, with no frames).
-RTSP_TIMEOUT_S = float(os.environ.get("AIPORT_RTSP_TIMEOUT_S") or 15)
+RTSP_TIMEOUT_S = envutil.env_float("AIPORT_RTSP_TIMEOUT_S", 15)
 _rtsp_timeout_flag = []   # cached: [flag or None]
 
 
@@ -178,14 +188,18 @@ def _rtsp_timeout_args():
     return [flag, str(int(RTSP_TIMEOUT_S * 1_000_000))] if flag else []
 
 
-def _hwdec_args(codec):
+def _hwdec_args(codec, direct=False):
     """Input decoder args for the active hardware backend, or empty (ffmpeg's
     auto-selected software decoder). Unknown/failed probe assumes h264, the
-    historical default."""
+    historical default. `direct`: pulled from the camera itself, not Protect's relay."""
     backend = _detect_hwdec()
     if not backend:
         return []
-    return list(_HWDEC_BACKENDS[backend].get(codec or "h264", []))
+    codec = codec or "h264"
+    args = _HWDEC_BACKENDS[backend].get(codec)
+    if not args and direct:
+        args = _HWDEC_DIRECT.get(backend, {}).get(codec)
+    return list(args or [])
 
 # Real detection: classify each analysed frame; tracks match by Norfair or IoU and share
 # one camera-wide event.
@@ -195,15 +209,15 @@ _motion_poll_stop = {}  # deviceID -> threading.Event, signals the poll loop to 
 _motion_poll_thread = {}  # deviceID -> threading.Thread, joined on stop
 _event_id_counter = itertools.count(int(time.time()))  # monotonic, avoids same-second collisions across tracks
 # Classification tick (AIPORT_TICK_S): 0.33 s on macOS (Core ML ~8 ms), 1.5 s elsewhere.
-MOTION_POLL_INTERVAL_S = float(os.environ.get("AIPORT_TICK_S")
-                               or (0.33 if sys.platform == "darwin" else 1.5))
+MOTION_POLL_INTERVAL_S = envutil.env_float("AIPORT_TICK_S",
+                                           0.33 if sys.platform == "darwin" else 1.5)
 # How often `moving` updates go to Protect: once per AIPORT_TICK_S.
 REPORT_INTERVAL_MS = int(MOTION_POLL_INTERVAL_S * 1000)
 # Analysed frames per camera per second (AIPORT_DETECT_FPS): 10 on macOS, else one per tick.
 DETECT_INTERVAL_S = min(MOTION_POLL_INTERVAL_S,
-                        1 / float(os.environ.get("AIPORT_DETECT_FPS")
-                                  or (10 if sys.platform == "darwin"
-                                      else 1 / MOTION_POLL_INTERVAL_S)))
+                        1 / envutil.env_float("AIPORT_DETECT_FPS",
+                                              10 if sys.platform == "darwin"
+                                              else 1 / MOTION_POLL_INTERVAL_S))
 DETECT_FPS = max(2, math.ceil(1 / DETECT_INTERVAL_S))
 # The loop analyses every frame, so timers use 1/DETECT_FPS; DETECT_INTERVAL_S is only the
 # idle timeout and differs from it when DETECT_FPS is floored to 2.
@@ -221,7 +235,7 @@ def _ticks(seconds):
 BOX_DISPLAY_MS = int(MOTION_POLL_INTERVAL_S * 1000) + 100
 # Seconds without a detection before a track closes (AIPORT_MISS_S, default 3); parked
 # tracks keep 30 s so flicker doesn't recreate them as arrivals.
-MOTION_MISS_TOLERANCE_S = float(os.environ.get("AIPORT_MISS_S") or 3)
+MOTION_MISS_TOLERANCE_S = envutil.env_float("AIPORT_MISS_S", 3)
 MOTION_MISS_TOLERANCE_TICKS = _ticks(MOTION_MISS_TOLERANCE_S)
 PARKED_MISS_TOLERANCE_TICKS = _ticks(30)
 # Reported boxes are smoothed (exponential, this weight on the newest detection) so per-frame
@@ -270,21 +284,7 @@ _MIN_INIT_SPEC = os.environ.get("AIPORT_MIN_INITIALIZED")
 
 def _parse_min_initialized(spec):
     """(default frames, {deviceID: frames}) from AIPORT_MIN_INITIALIZED."""
-    per = {}
-    default = _MIN_INIT_DEFAULT
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if "=" in part:
-                dev, n = part.split("=", 1)
-                per[dev.strip().upper()] = int(n)
-            else:
-                default = int(part)
-        except ValueError:
-            log.warning("ignoring bad AIPORT_MIN_INITIALIZED entry %r", part)
-    return default, per
+    return envutil.parse_keyed(spec, "AIPORT_MIN_INITIALIZED", _MIN_INIT_DEFAULT)
 
 
 MIN_INITIALIZED, _MIN_INITIALIZED_PER = _parse_min_initialized(_MIN_INIT_SPEC)
@@ -296,20 +296,7 @@ def _min_initialized(device_id):
 
 def _parse_true_thresh(spec):
     """AIPORT_TRUE_THRESH: "<default>[,<objectType>=<value>...]" -> (default, {type: value})."""
-    default, per = DEFAULT_TRUE_THRESH, {}
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if "=" in part:
-                name, value = part.split("=", 1)
-                per[name.strip()] = float(value)
-            else:
-                default = float(part)
-        except ValueError:
-            log.warning("ignoring bad AIPORT_TRUE_THRESH entry %r", part)
-    return default, per
+    return envutil.parse_keyed(spec, "AIPORT_TRUE_THRESH", DEFAULT_TRUE_THRESH, float, str)
 
 
 _TRUE_THRESH_DEFAULT, _TRUE_THRESH = _parse_true_thresh(os.environ.get("AIPORT_TRUE_THRESH"))
@@ -337,7 +324,7 @@ def _record_score(tr, score, device_id=None):
 
 # A same-type box where a track closed within RESUME_S resumes it (IoU >= RESUME_IOU with
 # its last or first box), as parked if it never moved: the returning car stopped re-arriving.
-RESUME_S = float(os.environ.get("AIPORT_RESUME_S") or 60)
+RESUME_S = envutil.env_float("AIPORT_RESUME_S", 60)
 RESUME_IOU = 0.4
 RESUME_MOVE_FRACTION = 0.25
 RESUME_MAX = 32
@@ -347,9 +334,8 @@ CONFIRM_WITH = {"face": "person", "licensePlate": "vehicle"}
 INSIDE_PARKED_FRACTION = 0.7
 # Motion gate: skip inference on a static frame with no open track, using Frigate's motion
 # boxes (AIPORT_MOTION_GATE=0 disables; without OpenCV it falls back to an average diff).
-MOTION_GATE = os.environ.get("AIPORT_MOTION_GATE", "1").strip().lower() not in (
-    "0", "false", "no", "off")
-MOTION_GATE_THRESH = float(os.environ.get("AIPORT_MOTION_GATE_THRESH", "0.02"))
+MOTION_GATE = envutil.env_bool("AIPORT_MOTION_GATE", True)
+MOTION_GATE_THRESH = envutil.env_float("AIPORT_MOTION_GATE_THRESH", 0.02)
 _GATE_STRIDE = 8  # sample every Nth pixel -> 80x80 grayscale for the diff
 # Zone reported when a track has none of its own; otherwise the zones it is actually in (a
 # web on the lens used to show under the upper zone because everything said zone 1).
@@ -392,7 +378,7 @@ FRAME_JPEG_KEEP_S = 2.0
 FRAME_JPEG_WAIT_S = 0.5  # how long a detection waits for its frame's JPEG
 # Full-res JPEGs per second of detection frames (AIPORT_FRAME_JPEG_FPS, 5): the source for
 # a track's best frame and thumbnail.
-FRAME_JPEG_FPS = float(os.environ.get("AIPORT_FRAME_JPEG_FPS") or 5)
+FRAME_JPEG_FPS = envutil.env_float("AIPORT_FRAME_JPEG_FPS", 5)
 FRAME_JPEG_EVERY = max(1, round(DETECT_FPS / FRAME_JPEG_FPS)) if FRAME_JPEG_FPS > 0 else 1
 _frame_jpeg_every = {}  # deviceID -> N of the running pull (a JPEG for detection frame 1, N+1, ...)
 _stream_dims = {}    # deviceID -> (width, height) of the real camera stream
@@ -448,12 +434,24 @@ BEST_FRAME_RECORDS_MAX = 40
 _enrich_cache = {}    # deviceID -> (snapshot mtime, plate/face detections read from it)
 # Third-party (ONVIF) cameras: Protect hands their video ingest to the AI Port,
 # which must push each channel to :7550 (see onvif_push.py).
-_onvif = onvif_push.PushManager(ffmpeg_bin=FFMPEG_BIN)
-# [hardware] detector / detector_model, set by main(); see detectors/__init__.py. The env
-# defaults also serve replay.py and the tests, which don't run main().
-DETECTOR_BACKEND = (os.environ.get("AIPORT_DETECTOR") or os.environ.get("AIPORT_BACKEND")
-                    or "auto").strip().lower()
-DETECTOR_MODEL = os.environ.get("AIPORT_MODEL_PATH") or None
+_onvif = onvif_push.PushManager(ffmpeg_bin=FFMPEG_BIN,
+                                push_factory=onvif_restream.Workers().push)
+
+
+def _detector_settings(cfg=None):
+    """(backend, model path): the env, then [hardware] detector / detector_model, then auto.
+    AIPORT_BACKEND is the pre-modular name (auto|rknn|onnx); keep it working. One reader for
+    import time (replay.py and the tests, which don't run main()) and _init_detector; they were
+    two copies, and only the import-time one lower-cased the backend."""
+    cfg = cfg or {}
+    backend = (os.environ.get("AIPORT_DETECTOR") or os.environ.get("AIPORT_BACKEND")
+               or cfg.get("detector") or "auto").strip().lower()
+    model = os.environ.get("AIPORT_MODEL_PATH") or cfg.get("detector_model") or None
+    return backend, model
+
+
+# See detectors/__init__.py; main() re-reads these with the cfg file.
+DETECTOR_BACKEND, DETECTOR_MODEL = _detector_settings()
 
 
 def _get_detector():
@@ -584,6 +582,7 @@ def _tmp_dir():
     AI Ports sharing a host never touch each other's files); emptied at startup with the
     rest of that dir (_reset_stream_dir). Made on
     use: macOS's periodic /tmp cleanup can remove it while diy-port runs."""
+    config.make_stream_dir(_STREAM_DIR)
     path = os.path.join(_STREAM_DIR, "tmp")
     os.makedirs(path, exist_ok=True)
     return path
@@ -632,9 +631,8 @@ def _frame_jpeg(device_id, seq, timeout=FRAME_JPEG_WAIT_S):
 
 # Region detection (Frigate's): aspect-correct detector frame, square crops around motion
 # and tracks (regions.py); on by default only on macOS.
-REGIONS = os.environ.get("AIPORT_REGIONS", "1" if sys.platform == "darwin" else "0"
-                         ).strip().lower() not in ("0", "false", "no", "off")
-DETECT_SIZE = int(os.environ.get("AIPORT_DETECT_SIZE") or 1280)
+REGIONS = envutil.env_bool("AIPORT_REGIONS", sys.platform == "darwin")
+DETECT_SIZE = envutil.env_int("AIPORT_DETECT_SIZE", 1280)
 PARKED_RECHECK_S = 10.0  # a parked object is re-detected this often (Frigate: 10 s of frames)
 
 
@@ -648,8 +646,7 @@ def _detect_dims(width=None, height=None):
 
 # Scale detector frames on the GPU (AIPORT_HW_SCALE, default on macOS): scale_vt keeps a
 # VideoToolbox stream on the GPU; a 1440p camera went from ~12% to ~2% of a core.
-HW_SCALE = os.environ.get("AIPORT_HW_SCALE", "1" if sys.platform == "darwin" else "0"
-                          ).strip().lower() not in ("0", "false", "no", "off")
+HW_SCALE = envutil.env_bool("AIPORT_HW_SCALE", sys.platform == "darwin")
 _hw_scale_failed = set()  # deviceIDs whose pull died with GPU scaling before any frame
 
 
@@ -679,20 +676,22 @@ def _hw_scale_mode(hwdec_args, device_id=None):
     return "vt" if "videotoolbox" in hwdec_args else "vt_upload"
 
 
-def _pull_video_args(codec, det_w, det_h, device_id=None):
+def _pull_video_args(codec, det_w, det_h, device_id=None, direct=False, rate=None):
     """(ffmpeg args before -i, filter graph, GPU scaling mode, JPEG every Nth frame) for a
-    stream of this codec. replay.py builds its pull from this too."""
-    hwdec = _hwdec_args(codec)
+    stream of this codec (`direct`: from the camera, not Protect's relay). replay.py builds
+    its pull from this too."""
+    hwdec = _hwdec_args(codec, direct)
     hw = _hw_scale_mode(hwdec, device_id)
     pre = list(hwdec)
     if hw == "vt":
         pre += ["-hwaccel_output_format", "videotoolbox_vld"]
     elif hw == "vt_upload":
         pre += ["-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt"]
-    return pre, _detect_filter_graph(det_w, det_h, hw, FRAME_JPEG_EVERY), hw, FRAME_JPEG_EVERY
+    return (pre, _detect_filter_graph(det_w, det_h, hw, FRAME_JPEG_EVERY, rate), hw,
+            FRAME_JPEG_EVERY)
 
 
-def _detect_filter_graph(width=DETECT_IMG_SIZE, height=None, hw=None, jpeg_every=1):
+def _detect_filter_graph(width=DETECT_IMG_SIZE, height=None, hw=None, jpeg_every=1, rate=None):
     """ffmpeg filter graph for the detection pipeline: [jpg] full-res frames (every
     `jpeg_every`th one), [det] all of them scaled for the detector, on the GPU for hw
     'vt'/'vt_upload'. replay.py runs clips through this same graph."""
@@ -705,7 +704,21 @@ def _detect_filter_graph(width=DETECT_IMG_SIZE, height=None, hw=None, jpeg_every
         det = f"format=nv12,hwupload,scale_vt={width}:{height},hwdownload,format=nv12"
     else:
         det = f"scale={width}:{height}"
-    return f"[0:v]fps={DETECT_FPS},split=2[jpgin][detin];[jpgin]{jpg}[jpg];[detin]{det}[det]"
+    rate = rate or f"fps={DETECT_FPS}"
+    return f"[0:v]{rate},split=2[jpgin][detin];[jpgin]{jpg}[jpg];[detin]{det}[det]"
+
+
+def _shared_decode_source(device_id, url):
+    """(socket path, analyse every Kth frame) to decode this ONVIF camera's pushed video1
+    (AIPORT_ONVIF_SHARED_DECODE), or None to pull the camera as before."""
+    if not (onvif_push.SHARED_DECODE and onvif_push.transcodes(device_id)):
+        return None
+    # OnvifStreamControl starts detection before set_source, so the source may not be known.
+    src = _onvif.source(device_id) or {}
+    if src.get("url") not in (None, url):
+        return None
+    fps = src.get("fps") or (_stream_probe.get(device_id) or {}).get("fps") or 20
+    return onvif_push.detect_socket(url), shared_decode.keep_ratio(fps, DETECT_FPS)
 
 
 # One ffmpeg pulls RTSP and splits post-decode into a full-res JPEG and an RGB detection
@@ -713,6 +726,7 @@ def _detect_filter_graph(width=DETECT_IMG_SIZE, height=None, hw=None, jpeg_every
 def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     """Pull from Protect's relay (ip/port/uri), or from `url` directly -- an
     ONVIF camera's own RTSP URL."""
+    direct = bool(url)
     url = url or f"rtsp://{ip}:{port}/{uri}"
     source = (str(ip), str(port), str(uri), url, width, height)
     proc = _active_streams.get(device_id)
@@ -720,27 +734,38 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
         return  # Protect re-issued the same stream (reset/reconnect): keep decoding
     _stop_stream(device_id)
     _stream_source[device_id] = source
-    os.makedirs(_STREAM_DIR, exist_ok=True)
+    config.make_stream_dir(_STREAM_DIR)
     _stream_dims[device_id] = (width or DETECT_IMG_SIZE, height or DETECT_IMG_SIZE)
     out_path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
     probe = _probe_stream(url)
     _stream_probe[device_id] = probe
+    shared = _shared_decode_source(device_id, url) if direct else None
     if probe["width"] and probe["height"]:
         # What the stream really is beats what the controller announced.
         _stream_dims[device_id] = (probe["width"], probe["height"])
     codec = probe["codec"]
     det_w, det_h = _detect_dims(width, height)
-    pre_args, graph, hw, jpeg_every = _pull_video_args(codec, det_w, det_h, device_id)
+    rate = input_args = None
+    if shared:
+        # Frames picked by count (shared_decode.keeps), not fps= by timestamp, so each
+        # output frame is a known input frame and takes its wall time (shared_decode.feed).
+        sock_path, keep = shared
+        codec, rate = "h264", shared_decode.select_filter(keep)
+    pre_args, graph, hw, jpeg_every = _pull_video_args(codec, det_w, det_h, device_id,
+                                                       direct=direct, rate=rate)
+    if shared:
+        input_args = [*pre_args, "-flags", "low_delay", "-f", "flv", "-i", "pipe:0"]
     encode_args = ["-c:v", "mjpeg_rkmpp"] if FFMPEG_BIN != "ffmpeg" else ["-c:v", "mjpeg"]
     # Plate/face reads use the snapshot file, so refresh it every second when they're on.
     snap_interval = 1.0 if enrich.smart_detect_features() else 2.0
     jpeg_r, jpeg_w = os.pipe()
     cmd = [
-        FFMPEG_BIN, "-loglevel", "warning", "-rtsp_transport", "tcp", *_rtsp_timeout_args(),
-        # Low-latency decode (no B-frame reorder delay). Not "-fflags nobuffer": with this
-        # split/fps pipeline it left the rawvideo detection output empty (ffmpeg 8).
-        "-flags", "low_delay",
-        *pre_args, "-i", url,
+        FFMPEG_BIN, "-loglevel", "warning", *(input_args or [
+            "-rtsp_transport", "tcp", *_rtsp_timeout_args(),
+            # Low-latency decode (no B-frame reorder delay). Not "-fflags nobuffer": with this
+            # split/fps pipeline it left the rawvideo detection output empty (ffmpeg 8).
+            "-flags", "low_delay",
+            *pre_args, "-i", url]),
         "-filter_complex", graph,
         # Passthrough on both outputs: per-output constant-rate padding drifted JPEG n from
         # detection frame n by up to 2.6 s.
@@ -752,9 +777,14 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
              "JPEG every %d frames)", device_id, url, codec, hw or "off", jpeg_every)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.PIPE if shared else subprocess.DEVNULL,
                                 pass_fds=(jpeg_w,))
     finally:
         os.close(jpeg_w)
+    walls = collections.deque()  # shared decode: wall ms of each frame ffmpeg will output
+    if shared:
+        threading.Thread(target=shared_decode.feed, args=(device_id, proc, *shared, walls),
+                         daemon=True, name=f"shared-decode-{device_id}").start()
     jpeg_pipe = os.fdopen(jpeg_r, "rb")
     stderr_tail = start_stderr_drain(proc)
     _active_streams[device_id] = proc
@@ -796,6 +826,13 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
                 # Stamp the frame as it leaves ffmpeg: events describe this moment, not
                 # the later tick that analyses it.
                 stamp = _now_ms()
+                if shared:
+                    try:  # the wall time Protect places this frame at
+                        wall = walls.popleft()
+                        stamp = (int(wall), stamp[1] - (stamp[0] - int(wall)))
+                    except IndexError:
+                        log.warning("shared decode for deviceID=%s: frame without a time",
+                                    device_id)
                 frame = np.frombuffer(buf, dtype=np.uint8).reshape((det_h, det_w, 3))
                 seq += 1
                 with _frame_cond:
@@ -906,7 +943,7 @@ def _is_excluded(device_id, coord):
 # Something on the lens: a person box touching two adjacent edges (top/bottom plus a side)
 # and spanning LENS_MIN_HEIGHT is dropped on AIPORT_LENS_FILTER cameras.
 LENS_EDGE = 10
-LENS_MIN_HEIGHT = int(os.environ.get("AIPORT_LENS_MIN_HEIGHT", "900"))
+LENS_MIN_HEIGHT = envutil.env_int("AIPORT_LENS_MIN_HEIGHT", 900)
 _LENS_FILTER = {v.strip().upper() for v in os.environ.get("AIPORT_LENS_FILTER", "").split(",")
                 if v.strip()}
 
@@ -989,7 +1026,6 @@ _redo_cache = {}   # deviceID -> [(monotonic s, label, cut-off box, detections o
 
 def _box_iou(a, b):
     """IoU of two (x1, y1, x2, y2) boxes."""
-    import regions
     inter = regions.intersection(a, b)
     if inter is None:
         return 0.0
@@ -1000,7 +1036,6 @@ def _box_iou(a, b):
 def _whole_of(d, got):
     """The detection in a second look that is the cut-off box's whole object: same label, the
     cut-off box mostly inside it. Only it is reused; anything else in that crop may move."""
-    import regions
     best = None
     for g in got:
         inter = regions.intersection(d["box"], g["box"])
@@ -1014,7 +1049,6 @@ def _whole_of(d, got):
 
 def _reused_redo(device_id, d, now, motion):
     """Detections of an earlier second look at this same cut-off box, or None."""
-    import regions
     if regions.intersects_any(d["box"], motion):
         return None
     for t, label, box, got in _redo_cache.get(device_id, ()):
@@ -1029,7 +1063,6 @@ def _detect_regions(device_id, detector, frame):
     (Frigate's process_frames), in detector-frame pixels. Parked objects are re-detected
     every PARKED_RECHECK_S or when motion touches them; otherwise they are passed on as
     their last box ("seeded"). The first frame of a stream gets a full startup look."""
-    import regions
     shape = frame.shape
     now = time.monotonic()
     with _motion_lock:
@@ -1575,6 +1608,57 @@ def _plate_settled(device_id, coord):
     return False
 
 
+# Plate/face reads come from the analysed frame's own JPEG (the one its person and vehicle
+# boxes came from), at most every AIPORT_ENRICH_INTERVAL_S; between reads a face box moves
+# with its person. Live 2026-11-06 on the onvif instance: face boxes were sluggish next to
+# exact person boxes, because reads came from the 1 s snapshot file and each result was
+# re-sent with every newer frame's time until the next snapshot.
+ENRICH_INTERVAL_S = envutil.env_float("AIPORT_ENRICH_INTERVAL_S", 0.25)
+_enrich_last_read = {}  # deviceID -> monotonic s of the last fresh plate/face read
+
+
+def _enrich_image(device_id, detections):
+    """(BGR image, key, (key, JPEG)) for this tick's plate/face reads. The key matching
+    _enrich_cache's means reuse it (the image is then just True)."""
+    cached = _enrich_cache.get(device_id)
+    now = time.monotonic()
+    last = _enrich_last_read.get(device_id)
+    if cached and last is not None and now - last < ENRICH_INTERVAL_S:
+        return True, cached[0], None
+    frame = next((d["frame"] for d in detections if d.get("frame")), None)
+    if frame is not None:
+        import cv2
+        import numpy as np
+        img = cv2.imdecode(np.frombuffer(frame[1], np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            _enrich_last_read[device_id] = now
+            return img, ("frame", frame[0]), frame
+    if cached and isinstance(cached[0], tuple) and last is not None and now - last < 1.0:
+        return True, cached[0], None  # a frame's read beats an older snapshot
+    img, mtime = _load_snapshot_bgr(device_id)
+    if img is not None and not (cached and cached[0] == mtime):
+        _enrich_last_read[device_id] = now
+    return img, mtime, _snapshot_bytes.get(device_id)
+
+
+def _follow_parent(face, people):
+    """A reused face read, moved by as much as its person has moved since the read."""
+    parent = face.get("parent_coord")
+    if not parent or not people:
+        return face
+    best = max(people, key=lambda p: _iou(p["coord"], parent))
+    if _iou(best["coord"], parent) <= 0:
+        return face
+    cur = best["coord"]
+    dx = cur[0] + cur[2] / 2 - parent[0] - parent[2] / 2
+    dy = cur[1] + cur[3] / 2 - parent[1] - parent[3] / 2
+    x, y, w, h = face["coord"]
+    end = CAMERA_COORD_END
+    face["coord"] = [min(max(0, x + dx), end - w), min(max(0, y + dy), end - h), w, h]
+    face["parent_coord"] = list(cur)
+    return face
+
+
 def _enrich_detections(device_id, detections):
     """Face detections (plus plate text on vehicles) from this tick's boxes.
     Protect reads a vehicle's plate from its descriptor `name` and recognises a
@@ -1588,7 +1672,7 @@ def _enrich_detections(device_id, detections):
     enricher = _get_enricher()
     if not (enricher.lpr and vehicles) and not (enricher.face and people):
         return []
-    img, mtime = _load_snapshot_bgr(device_id)
+    img, mtime, source = _enrich_image(device_id, detections)
     if img is None:
         return []
     cached = _enrich_cache.get(device_id)
@@ -1605,7 +1689,7 @@ def _enrich_detections(device_id, detections):
             for f in enricher.faces(img, [p["coord"] for p in people]):
                 face = {"objectType": "face", "score": f["score"], "coord": f["coord"],
                         "extra": {"name": f["name"], "tag": f["name"]},
-                        "frame": _snapshot_bytes.get(device_id), "size_px": f.get("size_px"),
+                        "frame": source, "size_px": f.get("size_px"),
                         "fresh_read": True, "parent_coord": list(people[f["parent"]]["coord"])}
                 # Under FACE_MATCH_MIN_PX: tracked, but no embedding, no match, not reported.
                 small = f.get("size_px", enrich.FACE_MATCH_MIN_PX) < enrich.FACE_MATCH_MIN_PX
@@ -1638,10 +1722,13 @@ def _enrich_detections(device_id, detections):
                      e["objectType"], device_id, e["score"], e["extra"]["name"],
                      "faceEmbed" in e.get("scored", {}), e.get("size_px"))
     # A face DB match counts once per snapshot read, not on every tick that reuses it.
-    return [dict(e, extra=dict(e["extra"]), fresh_read=fresh and e.get("fresh_read", False),
-                 **({"scored": {k: v for k, v in e["scored"].items() if fresh or k != "match"}}
-                    if "scored" in e else {}))
-            for e in extra]
+    out = [dict(e, extra=dict(e["extra"]), fresh_read=fresh and e.get("fresh_read", False),
+                **({"scored": {k: v for k, v in e["scored"].items() if fresh or k != "match"}}
+                   if "scored" in e else {}))
+           for e in extra]
+    if not fresh:
+        out = [_follow_parent(e, people) if e["objectType"] == "face" else e for e in out]
+    return out
 
 
 def _size_jump(a, b):
@@ -1742,7 +1829,7 @@ def _jaro_winkler(a, b):
 # and the plate is final once PLATE_AGREE_READS agree; one confident misread used to stick.
 PLATE_READS_KEEP = 25
 PLATE_CLUSTER_SIMILARITY = 0.85
-PLATE_AGREE_READS = int(os.environ.get("AIPORT_LPR_AGREE_READS") or 3)
+PLATE_AGREE_READS = envutil.env_int("AIPORT_LPR_AGREE_READS", 3)
 
 
 def _plate_rep(reads):
@@ -1853,58 +1940,44 @@ def _merge_extra(tr, d, device_id=None, tracker_id=None):
             scores[key] = score
 
 
-def _iou(box_a, box_b):
-    """Intersection-over-union of two [x, y, w, h] boxes."""
-    ax1, ay1, aw, ah = box_a
-    bx1, by1, bw, bh = box_b
-    ax2, ay2 = ax1 + aw, ay1 + ah
-    bx2, by2 = bx1 + bw, by1 + bh
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    union = aw * ah + bw * bh - inter
-    return inter / union if union > 0 else 0.0
+# [x, y, w, h] IoU; one copy in regions, shared with replay.
+_iou = regions.iou_xywh
+
+
+def _valid_zones(zones_field):
+    """(id, zone, polygon) for each usable zone in a zones/excludeZones field: a dict with an
+    even-length coord of >= 3 points. The one filter every parser below shares, so the ids,
+    types and polygons stay index-aligned (they were four copies of the check, and only the
+    map skipped non-dict entries)."""
+    for key, zone in (zones_field or {}).items():
+        if not isinstance(zone, dict):
+            continue
+        coord = zone.get("coord") or []
+        if len(coord) >= 6 and len(coord) % 2 == 0:
+            yield key, zone, list(zip(coord[0::2], coord[1::2]))
 
 
 def _parse_zone_ids(zones_field):
     """Each zone's id (Protect's key for it, an int when numeric), in _parse_zones' order.
     Protect labels an event with the ids its descriptors name (zone:<camera>:<id>)."""
-    out = []
-    for key, zone in (zones_field or {}).items():
-        coord = zone.get("coord") or []
-        if len(coord) >= 6 and len(coord) % 2 == 0:
-            out.append(int(key) if str(key).isdigit() else key)
-    return out
+    return [int(key) if str(key).isdigit() else key for key, _, _ in _valid_zones(zones_field)]
 
 
 def _parse_zone_types(zones_field):
     """Each zone's objectTypes (None when it doesn't say), in _parse_zones' order."""
-    out = []
-    for zone in (zones_field or {}).values():
-        coord = zone.get("coord") or []
-        if len(coord) >= 6 and len(coord) % 2 == 0:
-            types = zone.get("objectTypes")
-            out.append(list(types) if isinstance(types, list) else None)
-    return out
+    return [list(z["objectTypes"]) if isinstance(z.get("objectTypes"), list) else None
+            for _, z, _ in _valid_zones(zones_field)]
 
 
 def _parse_zone_map(zones_field):
     """Parse zones/excludeZones into {zone_id: polygon}, keeping the controller's id."""
-    out = {}
-    for zone_id, zone in (zones_field or {}).items():
-        if not isinstance(zone, dict):
-            continue
-        coord = zone.get("coord") or []
-        if len(coord) >= 6 and len(coord) % 2 == 0:
-            out[str(zone_id)] = list(zip(coord[0::2], coord[1::2]))
-    return out
+    return {str(key): poly for key, _, poly in _valid_zones(zones_field)}
 
 
 def _parse_zones(zones_field):
     """Parse ChangeSmartDetectSettings zones/excludeZones into polygons
     (even-length coord, >= 3 points)."""
-    return list(_parse_zone_map(zones_field).values())
+    return [poly for _, _, poly in _valid_zones(zones_field)]
 
 
 def _parse_lines(lines_field):
@@ -1991,8 +2064,15 @@ def _process_line_crossings(ws, device_id, tracker_id, tr, new_center):
 
 
 def _dedupe_detections(detections, iou_thresh=0.4):
-    """Collapse same-type detections that heavily overlap, highest score first: NMS can leave
-    a full-body and a torso box (IoU just under the gate), which would open two tracks."""
+    """Collapse same-type detections that heavily overlap into one (highest
+    score wins). Per-class NMS in detectors/postprocess.py uses NMS_THRESH 0.45, but two
+    boxes for ONE object can still survive it (e.g. a full-body box plus a
+    partial/torso box with IoU just under the gate) -- observed live as two
+    `person detected` ticks 1ms apart at scores 0.67/0.51 for the same person.
+    Left alone, each unmatched detection opens its own track, so one object
+    produces two tracks, two event streams, and no clean matched pair -- which
+    is fatal for line crossing (it needs a matched pair to get a movement
+    segment). An animal box on a person is _animal_on_person's."""
     out = []
     for d in sorted(detections, key=lambda d: -d["score"]):
         if any(d["objectType"] == k["objectType"] and _iou(d["coord"], k["coord"]) >= iou_thresh
@@ -2000,6 +2080,54 @@ def _dedupe_detections(detections, iou_thresh=0.4):
             continue
         out.append(d)
     return out
+
+
+# One object, two labels: per-class NMS keeps a person box and an animal box drawn on the same
+# person. Live 19:02 on Driveway a person walking up the drive was also "animal" on a few
+# frames (box IoU ~0.6 with the person's), confirmed and joined the event as an animal. An
+# animal box over a person box in the same frame, or over a person track seen within
+# CROSS_TYPE_RECENT_MS, is taken as that person, so the person's track keeps its frames.
+# Person always wins: letting the higher score or an existing animal track decide, the 13:33
+# Driveway replay (two people crossing) boxed the second person as an animal at 0.9, and every
+# person box after that went to the animal track. A dog beside its walker is a far smaller
+# box, so overlaps far less. Vehicles stay out: a rider on a motorcycle can overlap it this
+# much and both count. AIPORT_CROSS_TYPE_IOU sets the overlap; 0 turns this off.
+CROSS_TYPE_IOU = envutil.env_float("AIPORT_CROSS_TYPE_IOU", 0.5)
+CROSS_TYPE_RECENT_MS = 1000
+# A person *track* claims an animal box only once confirmed or scoring at least this. Live
+# 2026-11-12 06:25 on Driveway: a cat became person tracker 548, confirmed at a median 0.71
+# (threshold 0.70) with no animal ever logged. An unconfirmed, weak person track on the cat
+# could relabel every "animal" read of it as person and so carry itself to confirmation.
+CROSS_TYPE_TRACK_SCORE = envutil.env_float("AIPORT_CROSS_TYPE_TRACK_SCORE", 0.8)
+
+
+def _animal_on_person(tracks, detections, now_ms, device_id=None):
+    """Relabel as person each animal detection overlapping (IoU >= CROSS_TYPE_IOU) a person
+    detection in this frame or a confirmed (or CROSS_TYPE_TRACK_SCORE) person track seen
+    within CROSS_TYPE_RECENT_MS, then dedupe
+    the people. Returns the detections left."""
+    if CROSS_TYPE_IOU <= 0:
+        return detections
+    people = [d["coord"] for d in detections if d["objectType"] == "person"]
+    people += [tr["coord"] for tr in tracks.values() if tr["objectType"] == "person"
+               and now_ms - tr.get("seen_ms", now_ms) <= CROSS_TYPE_RECENT_MS
+               and (tr.get("confirmed") or tr.get("score", 0.0) >= CROSS_TYPE_TRACK_SCORE)]
+    changed = False
+    for d in detections:
+        if d["objectType"] != "animal":
+            continue
+        overlap = max((_iou(d["coord"], c) for c in people), default=0.0)
+        if overlap >= CROSS_TYPE_IOU:
+            log.info("real motion tick: animal box (score %.2f) over a person (IoU %.2f) "
+                     "taken as the person for deviceID=%s", d.get("score", 0.0), overlap,
+                     device_id)
+            d["objectType"] = "person"
+            changed = True
+    if not changed:
+        return detections
+    # Only the people need it; faces and plates (added after the dedupe) keep every read.
+    return (_dedupe_detections([d for d in detections if d["objectType"] == "person"])
+            + [d for d in detections if d["objectType"] != "person"])
 
 
 _scene_ref = {}  # deviceID -> (downsampled grayscale reference frame, monotonic ms taken)
@@ -2021,8 +2149,7 @@ def _motion_contour_area(device_id):
     blob, in pixels of the 100-row motion frame (Frigate's motion.contour_area; 10 by
     default, as in Frigate)."""
     import motion
-    default, per = _parse_box_delay(os.environ.get("AIPORT_MOTION_CONTOUR_AREA"),
-                                    "AIPORT_MOTION_CONTOUR_AREA", motion.DEFAULT_CONTOUR_AREA)
+    default, per = envutil.env_keyed("AIPORT_MOTION_CONTOUR_AREA", motion.DEFAULT_CONTOUR_AREA)
     return per.get(str(device_id).upper(), default)
 
 
@@ -2031,8 +2158,8 @@ def _motion_detector(device_id, shape):
     if det is None or det.frame_shape != tuple(shape[:2]):
         import motion
         settings = _motion_settings.get(device_id) or {}
-        override = os.environ.get("AIPORT_MOTION_THRESHOLD")
-        threshold = (int(override) if override and override.isdigit()
+        override = envutil.env_int("AIPORT_MOTION_THRESHOLD", None)
+        threshold = (override if override is not None and override >= 0
                      else motion.threshold_for_level(settings.get("level", 50)))
         mask = motion.zones_mask(settings.get("zones"), shape,
                                  lambda x, y: _canvas_to_image(device_id, x, y))
@@ -2089,12 +2216,9 @@ _event_start_ms = {}  # deviceID -> eventStartMSec from ChangeSmartDetectSetting
 
 
 def _confirm_ms(device_id):
-    override = os.environ.get("AIPORT_CONFIRM_MS")
-    if override:
-        try:
-            return max(0, int(override))
-        except ValueError:
-            log.warning("ignoring bad AIPORT_CONFIRM_MS %r", override)
+    override = envutil.env_int("AIPORT_CONFIRM_MS", None)
+    if override is not None:
+        return max(0, override)
     return _event_start_ms.get(device_id, 0)
 # A track still present when its event times out goes quiet (stationary) until its box
 # really leaves the parked spot; someone walking past only shrinks it for a moment.
@@ -2108,6 +2232,18 @@ STILL_IOU = 0.7
 STILL_TICKS = _ticks(30)
 STARTUP_WINDOW_MS = 15000
 PARK_WHEN_STILL = ("vehicle",)
+# Once confirmed, a still person or animal parks too, so someone standing in the driveway
+# doesn't hold the camera's one event open to its time limit and pull later passers-by into
+# it. A real camera does the same: a stationary tracker is a bystander, carried in the
+# descriptors but not holding the event (unifi-cam-proxy's EventSmartDetect captures). Their
+# face parks with them. Unlike a vehicle, a person who never moved still opens an event.
+PARK_WHEN_STILL_IN_EVENT = PARK_WHEN_STILL + ("person", "animal")
+# People standing and talking shift and gesture, so their box rarely keeps STILL_IOU with its
+# anchor for STILL_TICKS (live 10:42: three people stood ~1 minute, longest IoU run 36 s).
+# For them, still is the box centre staying within RESUME_MOVE_FRACTION of the anchor box's
+# size for STILL_PERSON_MS of frame time, which doesn't stretch when detection falls behind.
+STILL_BY_CENTRE = ("person", "animal")
+STILL_PERSON_MS = 20000
 
 
 def _center_moved(a, b, frac=RESUME_MOVE_FRACTION):
@@ -2155,6 +2291,8 @@ def _resume_recent(dev, d, event):
         else:
             continue
         found, best_iou = (i, tid, tr, how), iou
+    if found is None and d["objectType"] == "face" and event is not None:
+        found = _event_face(dev, d, event)
     if found is None:
         return None
     i, tid, tr, how = found
@@ -2162,16 +2300,67 @@ def _resume_recent(dev, d, event):
     return tid, tr, how
 
 
+# A face that turns up again in an open event continues the nearest face track that closed in
+# that event, wherever its person went: each face track is a face in Protect's list, and live
+# 15:44 on Driveway two people loading bikes, ducking behind a car, made 10 face tracks. A face
+# the embeddings show to be someone else (similarity under FACE_RESUME_MIN_SIM) starts its own,
+# and a named face is continued only by a read whose embedding shows the same person.
+FACE_RESUME_MIN_SIM = 0.3
+
+
+def _face_similarity(a, b):
+    """Cosine similarity of two embeddings, or None without both."""
+    if not a or not b:
+        return None
+    dot = sum(x * y for x, y in zip(a, b))
+    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / norm if norm else None
+
+
+def _person_moving(tracks, face):
+    """Whether a face track's person is tracked and not parked."""
+    person = tracks.get(face.get("person_tid"))
+    return person is not None and not person.get("stationary_coord")
+
+
+def _event_face(dev, d, event):
+    """(index in dev["recent"], tracker_id, track, "event") of the face track that closed
+    in `event` nearest face detection d, or None."""
+    emb = ((d.get("scored") or {}).get("faceEmbed") or (None,))[0]
+    cx, cy = d["coord"][0] + d["coord"][2] / 2, d["coord"][1] + d["coord"][3] / 2
+    best, best_dist = None, None
+    for i, (tid, tr, _closed_ms) in enumerate(dev.get("recent", ())):
+        if (tr["objectType"] != "face" or tr.get("event_id") != event["id"]
+                or tr.get("stationary_coord")):
+            continue
+        extra = tr.get("extra") or {}
+        sim = _face_similarity(emb, extra.get("faceEmbed"))
+        if sim is not None and sim < FACE_RESUME_MIN_SIM:
+            continue
+        if extra.get("matchedId") is not None and sim is None:
+            continue  # a named face takes only a read shown to be the same person
+        x, y, w, h = tr["coord"]
+        dist = math.hypot(x + w / 2 - cx, y + h / 2 - cy)
+        if best_dist is None or dist < best_dist:
+            best, best_dist = (i, tid, tr, "event"), dist
+    return best
+
+
 def _update_still(tr, now_ms):
     """Advance a track's stillness against its anchor box (detector jitter tolerated)."""
     anchor = tr.get("anchor")
-    if anchor is None or _iou(tr["coord"], anchor) < STILL_IOU:
+    by_centre = tr.get("objectType") in STILL_BY_CENTRE
+    if anchor is None or (_center_moved(anchor, tr["coord"]) if by_centre
+                          else _iou(tr["coord"], anchor) < STILL_IOU):
         tr["anchor"] = list(tr["coord"])
         tr["still_ticks"] = 0
         tr["still_since_ms"] = now_ms
     else:
         tr["still_ticks"] = tr.get("still_ticks", 0) + 1
-    tr["still"] = tr["still_ticks"] >= STILL_TICKS
+    if by_centre:
+        tr["still"] = now_ms - tr["still_since_ms"] >= STILL_PERSON_MS
+    else:
+        tr["still"] = tr["still_ticks"] >= STILL_TICKS
 
 
 def _park(tr):
@@ -2270,6 +2459,12 @@ LEAVE_PRIORITY = {"face": 0, "person": 1, "vehicle": 2, "animal": 3}
 # A multi-participant leave: empty descriptors, one snapshot each, attributes in
 # trackerIDAttrMap; falls back to the single-tracker leave after LEAVE_FALLBACK_S.
 LEAVE_FALLBACK_S = 4.0
+# Each participant's final descriptor (best-frame box and score) also goes in that leave:
+# with empty descriptors Protect showed every multi-participant event at 30% (live
+# 2026-10-29: a person sent at 51 and a vehicle at 68 both showed 30%), while
+# single-participant leaves, which carry a descriptor, showed their real score.
+# AIPORT_MULTI_LEAVE_DESCRIPTORS=0 goes back to empty descriptors.
+MULTI_LEAVE_DESCRIPTORS = envutil.env_bool("AIPORT_MULTI_LEAVE_DESCRIPTORS", True)
 _pending_leaves = {}  # snapshot filename -> shared {"seen": bool} for a multi-tracker leave
 
 
@@ -2454,7 +2649,7 @@ def _send_multi_leave(ws, device_id, event_id, members, fallback):
     _record_snapshot_filename(fullfov, device_id, kind="fullfov",
                               jpeg=first_best["jpeg"] if first_best else None)
     faces_by_person = _associate_faces(members)
-    snapshots, attr_map = [], {}
+    snapshots, attr_map, descriptors = [], {}, []
     for tid, tr in members:
         b = tr.get("best")
         crop = list(b["coord"] if b else tr["coord"])
@@ -2463,7 +2658,20 @@ def _send_multi_leave(ws, device_id, event_id, members, fallback):
         name = f"smartdetectsnap_zone_{tid}{wall}.jpg"
         _record_snapshot_filename(name, device_id, kind="object", coord=crop,
                                   jpeg=b["jpeg"] if b else None)
-        level = int(round(tr["score"] * 100)) if tr["score"] <= 1 else int(round(tr["score"]))
+        # The best frame's score, as the snapshot is that frame (not the last read).
+        score = b["score"] if b and b.get("score") is not None else tr["score"]
+        level = int(round(score * 100)) if score <= 1 else int(round(score))
+        if MULTI_LEAVE_DESCRIPTORS:
+            descriptors.append({
+                "attributes": None, "boxColor": "cyan", "confidenceLevel": level,
+                "coord": box, "coord3d": [-1, -1], "firstShownTimeMs": tr["first_shown_ms"],
+                "idleSinceTimeMs": tr.get("still_since_ms") if tr.get("still")
+                else tr["first_shown_ms"],
+                "intelligenceZones": [], "lines": [], "loiterZones": [], "name": "",
+                "objectType": tr["objectType"], "secondLensZones": [],
+                "stationary": bool(tr.get("still") or tr.get("stationary_coord")), "tag": "",
+                "trackerID": tid, "zones": _track_zones(tr.get("zone_ids")),
+            })
         snapshots.append({
             "clockBestMonotonic": 0, "clockBestWall": wall, "confidenceLevel": level,
             "coord": box, "framingRect": box, "reVerifyEligible": False,
@@ -2476,8 +2684,7 @@ def _send_multi_leave(ws, device_id, event_id, members, fallback):
     payload = {
         "deviceID": device_id, "clockMonotonic": clock_mono, "clockStream": clock_stream,
         "clockStreamRate": 1000, "clockWall": _clock_wall(device_id, now_ms),
-        # Departing trackers aren't repeated in descriptors (real captures, notes s7).
-        "descriptors": [], "displayTimeoutMSec": 200, "edgeType": "leave",
+        "descriptors": descriptors, "displayTimeoutMSec": 200, "edgeType": "leave",
         "eventId": event_id, "objectTypes": [],
         "smartDetectSnapshotFullFoV": fullfov,
         "smartDetectSnapshotFullFoVHeight": fov_h, "smartDetectSnapshotFullFoVWidth": fov_w,
@@ -2777,10 +2984,14 @@ def _motion_tick(ws, device_id):
         if dev.get("started_ms") is None and device_id in _analysed_frame_time:
             dev["started_ms"] = now_ms
         starting = dev.get("started_ms") is None or now_ms - dev["started_ms"] <= STARTUP_WINDOW_MS  # {"id", "started_ms", "finished": [(tid, tr)]} or None
-        unclaimed = list(range(len(detections)))
         joining = []  # tracks that start (or resume) taking part in the event this tick
-        # Zones decide what is reported, not what is tracked: a track joins when its feet
-        # have been in a zone for its type, and a gap between zones must not starve it.
+        detections = _animal_on_person(tracks, detections, now_ms, device_id)
+        unclaimed = list(range(len(detections)))
+        # Zones decide what's reported, not what's tracked (as Frigate): every detection is
+        # tracked; a track joins the event only once its feet have been in a zone listing its
+        # type, and stays in it until it's gone. Live 11:38 on Camera B a walk to the front door
+        # crossed a gap between zones; dropping the detections there starved the person's track,
+        # named Alex, and it never made the event.
         for d in detections:
             if "in_zone" not in d:
                 d["zone_ids"] = _zones_of(device_id, d["coord"], d["objectType"])
@@ -2827,6 +3038,17 @@ def _motion_tick(ws, device_id):
                         # someone walking past): it stays where it parked.
                         tr["coord"] = list(tr["stationary_coord"])
                         tr["moved_ticks"] = 0
+                    elif tr["objectType"] == "face" and not _person_moving(tracks, tr):
+                        # A face moves with its person. Live 15:43 on Driveway faces parked
+                        # since 12:36 and 12:39 took a passing face at their spot and rejoined
+                        # as faces of their own: the parked face goes, and the read starts or
+                        # resumes a track like any other.
+                        log.info("real motion tick: parked face tracker_id=%s dropped, its "
+                                 "person isn't moving; the face at its spot is someone else's "
+                                 "for deviceID=%s", tracker_id, device_id)
+                        unclaimed.append(matches.pop(tracker_id))
+                        del tracks[tracker_id]
+                        continue
                     else:
                         # A stationary object moved again: it rejoins as a fresh participant.
                         log.info("real motion tick: stationary %s tracker_id=%s moved, rejoining "
@@ -2882,7 +3104,11 @@ def _motion_tick(ws, device_id):
                       "track for deviceID=%s tracker_id=%s (last seen: %s score=%.2f)",
                       tolerance, device_id, tracker_id,
                       tr["objectType"], tr["score"])
-            if event is not None and not tr.get("stationary_coord"):
+            # Only a track that joined the event goes in its leave: one that closes while the
+            # event is open without having joined (never confirmed, or never in a zone for its
+            # type, like a car on the far road at 11:57) isn't a participant.
+            if (event is not None and not tr.get("stationary_coord")
+                    and tr.get("event_id") == event["id"]):
                 event["finished"].append((tracker_id, tr))  # its snapshot goes in the leave
             _close_line_events(ws, device_id, tracker_id, tr)
             _save_face_crop(device_id, tracker_id, tr)
@@ -2982,20 +3208,26 @@ def _motion_tick(ws, device_id):
                          device_id)
                 joining.append((tid, tr))
 
-        # 3. A vehicle that has stopped (still ~30 s) parks; its snapshot stays in the leave.
-        #    One that never left its first box parks with no event.
+        # 3. A vehicle, person or animal that has stopped (still ~30 s) parks; its snapshot
+        #    stays in the leave. A vehicle that never left its first box parks with no event.
         for tid, tr in tracks.items():
             if (not tr.get("stationary_coord") and tr.get("still")
                     and tr["objectType"] in PARK_WHEN_STILL and not tr.get("confirmed", True)
                     and tr.get("true_positive") and not tr.get("left_first_box")):
                 tr["confirmed"] = True
             if (not tr.get("stationary_coord") and tr.get("still")
-                    and tr["objectType"] in PARK_WHEN_STILL and tr.get("confirmed", True)):
+                    and tr["objectType"] in PARK_WHEN_STILL_IN_EVENT and tr.get("confirmed", True)):
                 log.info("real motion tick: %s tracker_id=%s still for %d ticks, parked for "
                          "deviceID=%s", tr["objectType"], tid, tr["still_ticks"], device_id)
-                _park(tr)
-                if event is not None and tr.get("event_id") == event["id"]:
-                    event["finished"].append((tid, tr))
+                parking = [(tid, tr)]
+                face = tracks.get(tr.get("face_tid"))
+                if face is not None and face["objectType"] == "face" \
+                        and not face.get("stationary_coord"):
+                    parking.append((tr["face_tid"], face))
+                for ptid, ptr in parking:
+                    _park(ptr)
+                    if event is not None and ptr.get("event_id") == event["id"]:
+                        event["finished"].append((ptid, ptr))
 
         # 3b. A face or plate confirms as soon as its parent track is confirmed; a face only
         # after a read big enough to name.
@@ -3605,9 +3837,9 @@ def _download_face_db(uri, device_info):
 # Protect's known faces (docs/protect-face-matching.md), reloaded when Protect sends a new
 # DB; a face names a subject after FACE_MATCH_HITS matches at AIPORT_FACE_DB_THRESH.
 FACE_MATCH_HITS = 2
-FACE_DB_THRESH = float(os.environ.get("AIPORT_FACE_DB_THRESH") or 0.45)
+FACE_DB_THRESH = envutil.env_float("AIPORT_FACE_DB_THRESH", 0.45)
 # Smallest face read (shorter side, snapshot px) whose embedding is sent to Protect.
-FACE_EMBED_MIN_PX = int(os.environ.get("AIPORT_FACE_EMBED_MIN_PX") or 60)
+FACE_EMBED_MIN_PX = envutil.env_int("AIPORT_FACE_EMBED_MIN_PX", 60)
 _face_db = None
 _face_db_tried = False
 
@@ -3623,23 +3855,9 @@ def _get_face_db():
     return _face_db
 
 
-def _parse_box_delay(spec, name="AIPORT_BOX_DELAY_MS", default=0):
-    """A per-camera integer setting such as AIPORT_BOX_DELAY_MS: "<default>[,<deviceID>=<value>
-    ...]" -> (default, {deviceID: value})."""
-    per = {}
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if "=" in part:
-                dev, ms = part.split("=", 1)
-                per[dev.strip().upper()] = int(ms)
-            else:
-                default = int(part)
-        except ValueError:
-            log.warning("ignoring bad %s entry %r", name, part)
-    return default, per
+def _parse_box_delay(spec):
+    """AIPORT_BOX_DELAY_MS: "<default>[,<deviceID>=<ms>...]" -> (default, {deviceID: ms})."""
+    return envutil.parse_keyed(spec, "AIPORT_BOX_DELAY_MS", 0)
 
 
 # Playback places boxes by clockWall; event times come from when the analysed frame left
@@ -3690,8 +3908,8 @@ def _frame_wall_ms(device_id):
 # clock* fields, and optionally shift clockWall, to see which clock Protect places boxes by.
 CAMERA_CLOCK_DEVICES = {d.strip().upper() for d in
                         os.environ.get("AIPORT_CAMERA_CLOCK", "").split(",") if d.strip()}
-_WALL_SKEW_DEFAULT_MS, _WALL_SKEW_MS = _parse_box_delay(
-    os.environ.get("AIPORT_CLOCK_WALL_SKEW_MS"), "AIPORT_CLOCK_WALL_SKEW_MS")
+_WALL_SKEW_DEFAULT_MS, _WALL_SKEW_MS = envutil.env_keyed(
+    "AIPORT_CLOCK_WALL_SKEW_MS", 0)
 _camera_clocks = {}  # deviceID -> camera_clock.Reader (kept across stream restarts)
 
 
@@ -3992,7 +4210,7 @@ def _camera_health(device_id, now):
 
 # A pull with no frame for this long is killed and restarted; the read timeout misses a
 # pull stuck past the socket.
-STREAM_STALL_S = float(os.environ.get("AIPORT_STREAM_STALL_S") or 30)
+STREAM_STALL_S = envutil.env_float("AIPORT_STREAM_STALL_S", 30)
 
 
 def _restart_stalled_pulls(now_ms=None):
@@ -4016,6 +4234,25 @@ def _restart_stalled_pulls(now_ms=None):
         proc.kill()
         killed.append(device_id)
     return killed
+
+
+_restream_stalled = {}  # deviceID -> channels last reported as delivering nothing
+
+
+def _check_restream(now=None):
+    """Log when a camera's restream stops or resumes delivering video to Protect. Its health
+    is apart from detection's: during the 2.5 h hang of live 2026-11-03 17:24 a camera's
+    detection could run on while Protect got no video, and _camera_health only sees detection."""
+    stalled = _onvif.stalled_channels(STREAM_STALL_S, now)
+    for device_id, channels in stalled.items():
+        if _restream_stalled.get(device_id) != channels:
+            log.warning("camera deviceID=%s restream: no video to Protect on %s for %.0f s",
+                        device_id, ", ".join(channels), STREAM_STALL_S)
+            _restream_stalled[device_id] = channels
+    for device_id in [d for d in _restream_stalled if d not in stalled]:
+        del _restream_stalled[device_id]
+        if _onvif.has_source(device_id):  # otherwise Protect stopped the camera: no news
+            log.info("camera deviceID=%s restream: video to Protect again", device_id)
 
 
 def _check_status(ws, now=None):
@@ -4048,6 +4285,10 @@ def _start_status_watch():
                 _restart_stalled_pulls()
             except Exception:
                 log.exception("stalled pull check failed")
+            try:
+                _check_restream()
+            except Exception:
+                log.exception("restream check failed")
             ws = _status_ws
             if ws is None:
                 continue
@@ -4169,6 +4410,29 @@ def _apply_motion_settings(payload):
         _motion_detectors.pop(device_id, None)
 
 
+# Experiment 2026-11-04: ONVIF cameras whose ChangeVideoSettings reply says audio is off (empty or
+# 0 for none, 1 for all, or a list of device IDs), while browser live view on them doesn't resume after about a minute
+# away from the page. Only the reply changes: the push keeps its audio track, since Protect's
+# media server needs one to finish initializing.
+_ONVIF_AUDIO_OFF = onvif_push.parse_camera_list(os.environ.get("AIPORT_ONVIF_AUDIO_OFF"))
+
+
+def _reports_audio_off(device_id):
+    return _ONVIF_AUDIO_OFF is True or bool(_ONVIF_AUDIO_OFF) and device_id in _ONVIF_AUDIO_OFF
+
+
+def _onvif_main_size(device_id, payload):
+    """(width, height) an ONVIF camera's main stream is pushed at: as probed, else as already
+    set (a failed probe must not change the size and so restart a transcode), else as announced."""
+    probe = _stream_probe.get(device_id) or {}
+    if probe.get("width") and probe.get("height"):
+        return probe["width"], probe["height"]
+    src = _onvif.source(device_id) or {}
+    if src.get("width") and src.get("height"):
+        return src["width"], src["height"]
+    return payload.get("width"), payload.get("height")
+
+
 def _stop_one_stream(device_id, preserve_tracks=True, ws=None):
     _stream_points.pop(device_id, None)
     # Stop inference first so its leaves go out before the snapshot file is removed.
@@ -4280,12 +4544,17 @@ def handle_function(ws, msg, device_info):
             try:
                 with _reset_lock:
                     _reset_pending.pop(device_id, None)
-                _onvif.set_source(device_id, url, audio=payload.get("audio", True),
-                                  width=payload.get("width"), height=payload.get("height"),
-                                  fps=payload.get("fps"))
                 _stream_restart_count.pop(device_id, None)
-                _start_stream(device_id, None, None, None, payload.get("width"),
-                              payload.get("height"), url=url)
+                try:
+                    _start_stream(device_id, None, None, None, payload.get("width"),
+                                  payload.get("height"), url=url)
+                finally:
+                    # After the probe: a transcode encodes at this size and Protect is told it,
+                    # so the camera's real size beats the announced one. Detection failing to
+                    # start must not cost the camera its video.
+                    width, height = _onvif_main_size(device_id, payload)
+                    _onvif.set_source(device_id, url, audio=payload.get("audio", True),
+                                      width=width, height=height, fps=payload.get("fps"))
                 _start_motion_detector(ws, device_id, preserve_tracks=True)
                 # Counted, health-watched and stall-checked like a UiStreamControl camera.
                 points = _stream_points_for(payload.get("width"), payload.get("height"),
@@ -4356,18 +4625,29 @@ def handle_function(ws, msg, device_info):
         if payload.get("deviceID") and isinstance(payload.get("video"), dict):
             _onvif.configure(payload["deviceID"], payload["video"])
             onvif_src = _onvif.source(payload["deviceID"])
+            _onvif.wait_for_substream(payload["deviceID"])
         if onvif_src:
-            # Every channel carries the main stream, so report its probed geometry; a wrong
-            # size breaks the web player.
+            # Channels carry the camera's main stream (video2/video3 its substream, if it
+            # has one), so report their real geometry -- the main one probed, since Protect
+            # echoes back whatever we answered before. A wrong size breaks the web
+            # player (it sizes its decoder from it).
             probe = _stream_probe.get(payload["deviceID"]) or {}
             channel = {"enabled": True,
                        "width": probe.get("width") or onvif_src["width"] or 1920,
                        "height": probe.get("height") or onvif_src["height"] or 1080,
                        "fps": probe.get("fps") or onvif_src["fps"] or 15,
                        "bitrate": 8000000}
+            sub = _onvif.substream(payload["deviceID"])
+            sub_channel = {"enabled": True, "width": sub["width"], "height": sub["height"],
+                           "fps": sub["fps"] or channel["fps"], "bitrate": 1000000} if sub else None
+            video = {k: dict(sub_channel if sub and k in onvif_push.SUB_CHANNELS else channel)
+                     for k in payload["video"]}
+            encoded = _onvif.transcode_channels(payload["deviceID"]) or {}
+            for k in video:
+                video[k].update(encoded.get(k) or {})
             send_msg(ws, "ChangeVideoSettings", {
-                "video": {k: dict(channel) for k in payload["video"]},
-                "audio": {"enabled": True, "volume": 100},
+                "video": video,
+                "audio": {"enabled": not _reports_audio_off(payload["deviceID"]), "volume": 100},
             }, in_response_to=msg_id)
             return
         send_msg(ws, "ChangeVideoSettings", {
@@ -4550,6 +4830,64 @@ def _clear_adopt_state():
 # No wait-for-adopt gate: the unsolicited pre-adopt connection is load-bearing for candidate identity.
 
 
+# An adopted AI Port that Protect has been hanging up on, without a word, for this long is
+# probably no longer adopted (0: never warn). Protect sends no reason, and ResetToDefaults only
+# comes if we're connected at the moment of the removal: it isn't once in the log from
+# 2026-10-28 through four removals. Live 2026-11-02 19:30 on the ONVIF test instance: 699 closes
+# in a row with a token in adopt_state.json, each a generic ConnectionClosedError. Ordinary
+# reconnects settled sooner (65-78 s on 2026-11-03 and 2026-11-04), so this waits longer.
+REFUSED_WARN_S = envutil.env_float("AIPORT_REFUSED_WARN_S", 180)
+
+
+class _RefusalWatch:
+    """Notices when Protect keeps accepting our connection and closing it with nothing said.
+    A connection that never opens means the console is down, so it starts the count again."""
+
+    def __init__(self, warn_s=REFUSED_WARN_S, clock=time.monotonic):
+        self.warn_s = warn_s
+        self.clock = clock
+        self._open = self._heard = self._warned = False
+        self._since = None
+        self._closes = 0
+
+    def _reset(self):
+        self._since, self._closes, self._warned = None, 0, False
+
+    def connected(self):
+        self._open, self._heard = True, False
+
+    def heard(self):
+        """Any frame from Protect, on the first one of a connection."""
+        if self._heard:
+            return
+        self._heard = True
+        if self._warned:
+            log.info("Protect is answering this AI Port again")
+        self._reset()
+
+    def ended(self, adopted):
+        """After each attempt. `adopted`: adopt_state.json had a token or hosts for it. Before
+        adoption these closes are normal: 2026-11-02 had 26 of them until adoption at 20:37."""
+        opened, self._open = self._open, False
+        if not opened or not adopted:
+            self._reset()
+            return
+        if self._heard:
+            return
+        now = self.clock()
+        self._since = now if self._since is None else self._since
+        self._closes += 1
+        if self.warn_s and not self._warned and now - self._since >= self.warn_s:
+            self._warned = True
+            log.warning("Protect has closed the last %d connections right after they opened, "
+                        "over %.0f s, without a message: was this AI Port removed in Protect? "
+                        "If so, move %s aside and adopt it again", self._closes,
+                        now - self._since, ADOPT_STATE_FILE)
+
+
+_refusals = _RefusalWatch()
+
+
 def run(host, port, device_info, token=None):
     # connectionHost must be the controller's (Protect builds camera-upload URLs
     # from it), not ours -- self-IP left paired cameras without thumbnails.
@@ -4576,6 +4914,7 @@ def run(host, port, device_info, token=None):
     with connect(url, subprotocols=["secure_transfer"], additional_headers=headers,
                  ssl=ctx, open_timeout=15) as ws:
         log.info("CLASSIC AVCLIENT WSS CONNECTED (subprotocol=%s)", ws.subprotocol)
+        _refusals.connected()
         global _status_ws
         _status_ws = ws
         # hwrev must be non-null or hardwareRevision stays empty; 1 is a placeholder.
@@ -4611,6 +4950,7 @@ def run(host, port, device_info, token=None):
 
         try:
             for raw in ws:
+                _refusals.heard()
                 # Controller sends JSON as BINARY frames; decode bytes as UTF-8 JSON.
                 text = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
                 try:
@@ -4637,13 +4977,8 @@ def _init_detector(cfg):
     size. A failure is logged, not fatal: the device still pairs and relays
     snapshots, and classification retries the load each tick."""
     global DETECTOR_BACKEND, DETECTOR_MODEL
-    # AIPORT_BACKEND is the pre-modular name (auto|rknn|onnx); keep it working.
-    DETECTOR_BACKEND = (os.environ.get("AIPORT_DETECTOR")
-                        or os.environ.get("AIPORT_BACKEND")
-                        or cfg.get("detector") or "auto")
-    DETECTOR_MODEL = os.environ.get("AIPORT_MODEL_PATH") or cfg.get("detector_model") or None
-    if DETECTOR_BACKEND.strip().lower() == "none":
-        DETECTOR_BACKEND = "none"
+    DETECTOR_BACKEND, DETECTOR_MODEL = _detector_settings(cfg)
+    if DETECTOR_BACKEND == "none":
         log.info("detector backend 'none': object detection disabled")
         return
     try:
@@ -4791,6 +5126,7 @@ def main():
             return
         except Exception as e:
             log.warning("classic avclient connection ended: %r", e)
+        _refusals.ended(bool(token or hosts))
         # Always pace reconnects; a clean close must not skip the sleep (rate limiter is 60 msgs/60s).
         elapsed = time.time() - start
         time.sleep(max(0.0, 5.0 - elapsed))

@@ -63,10 +63,16 @@ class TestServiceScript(unittest.TestCase):
                                      stderr=subprocess.STDOUT)
 
     def tearDown(self):
+        # SIGINT, as Ctrl-C: SIGKILL left the script's diy-port (in its own process group)
+        # and log writer running, one more after every suite run.
         for p in (self.proc, self.orphan):
             if p is not None and p.poll() is None:
-                p.kill()
-                p.wait()
+                p.send_signal(signal.SIGINT)
+                try:
+                    p.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
         if self.proc is not None:
             self.proc.stdout.close()
 
@@ -91,6 +97,17 @@ class TestServiceScript(unittest.TestCase):
                 return self.lines(prefix)
             time.sleep(0.1)
         self.fail("timed out waiting for %d %r line(s); got %s" % (count, prefix, self.lines("")))
+
+    def test_bind_ip_and_the_instance_state_dir(self):
+        # DIYPORT_STATE_DIR left out: the instance's own state/ under ~/.diy-port.
+        with open(self.env_file, "w") as f:
+            f.write("DIYPORT_IFACE=en0\nDIYPORT_MAC=AA\nDIYPORT_DEVICE_ID=dev\n"
+                    "DIYPORT_BIND_IP=192.0.2.9\n")
+        self.env["DIYPORT_INSTANCE"] = "test-instance"
+        self.start()
+        args = " ".join(self.wait_for("start", 1)[0])
+        self.assertIn("--bind-ip 192.0.2.9", args)
+        self.assertIn("/.diy-port/test-instance/state ", args + " ")
 
     def test_restart_and_stop(self):
         self.start()

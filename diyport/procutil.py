@@ -22,6 +22,11 @@ def start_stderr_drain(proc, max_lines=200):
                 tail.append(line)
         except (OSError, ValueError):
             pass
+        finally:
+            try:
+                stream.close()  # at EOF: the child is gone, don't leave the pipe to the GC
+            except (OSError, ValueError):
+                pass
 
     threading.Thread(target=_drain, daemon=True, name="stderr-drain").start()
 

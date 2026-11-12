@@ -363,6 +363,7 @@ def check(expect, events):
         if not _within(n, want):
             bad.append("%d %s track(s), expected %s" % (n, kind, want))
     if expect.get("distinct_face_snapshots"):
+        from regions import iou_xywh as _iou
         faces = [o for o in objects if o["type"] == "face" and o.get("snapshot")]
         for i, a in enumerate(faces):
             for b in faces[i + 1:]:
@@ -386,16 +387,6 @@ def check(expect, events):
                 bad.append("vehicle #%s %s %s, expected %s"
                            % (tracker, field.replace("_", " "), value, " or ".join(want)))
     return bad
-
-
-def _iou(a, b):
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    iw = min(ax + aw, bx + bw) - max(ax, bx)
-    ih = min(ay + ah, by + bh) - max(ay, by)
-    if iw <= 0 or ih <= 0:
-        return 0.0
-    return iw * ih / float(aw * ah + bw * bh - iw * ih)
 
 
 # A clip replays in about real time or faster (the longest, 60 s, took ~70 s); one still going

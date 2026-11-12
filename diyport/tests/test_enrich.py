@@ -309,6 +309,35 @@ class TestFaceDb(unittest.TestCase):
         self.assertEqual(avclient._describe_face_db(f.name), "gzip")
 
 
+class TestFaceDrop(unittest.TestCase):
+    """A face read with a short SFace vector (the back of a head, a face turned away) is
+    dropped once big enough for the length to mean something."""
+
+    def read(self, size_px, norm):
+        from unittest import mock
+        e = enrich.Enricher(faces_dir=None)
+        e.face = True
+        row = np.zeros(15, dtype=np.float32)
+        row[2:4], row[14] = size_px, 0.9
+        yunet = mock.Mock(detect=mock.Mock(return_value=(None, np.array([row]))))
+        vec = np.zeros(128, dtype=np.float32)
+        vec[0] = norm
+        sface = mock.Mock(alignCrop=mock.Mock(return_value=None),
+                          feature=mock.Mock(return_value=vec))
+        with mock.patch.object(e, "_get_face_models", return_value=(yunet, sface)), \
+                mock.patch.object(e, "_refresh_gallery"):
+            return e.faces(np.zeros((400, 400, 3), dtype=np.uint8), [[0, 0, 1000, 1000]])
+
+    def test_short_vector_dropped(self):
+        self.assertEqual(self.read(60, 4.3), [])
+
+    def test_good_face_kept(self):
+        self.assertEqual(len(self.read(60, 6.7)), 1)
+
+    def test_small_face_kept_whatever_its_length(self):
+        self.assertEqual(len(self.read(30, 3.0)), 1)
+
+
 _SAMPLES = os.environ.get("AIPORT_ENRICH_SAMPLES")
 
 

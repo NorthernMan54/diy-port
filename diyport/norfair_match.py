@@ -12,6 +12,7 @@ where each object will be from how it has been moving, so a fast walker or a car
 the frame keeps its object between frames.
 """
 import logging
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -38,22 +39,21 @@ DEFAULT_SETTINGS = {"R": 3.4, "distance_threshold": 2.5}
 
 def distance(detection, estimate):
     """Frigate's distance between two boxes given as [[x1, y1], [x2, y2]]: bottom-centre
-    offset relative to the estimate's size, plus the width and height ratios."""
-    estimate_dim = np.diff(estimate, axis=0).flatten()
-    detection_dim = np.diff(detection, axis=0).flatten()
-    if (not np.all(np.isfinite(estimate_dim)) or not np.all(np.isfinite(detection_dim))
-            or estimate_dim[0] <= 0 or estimate_dim[1] <= 0
-            or detection_dim[0] <= 0 or detection_dim[1] <= 0):
+    offset relative to the estimate's size, plus the width and height ratios.
+
+    Plain floats, not numpy: profiled live 2026-11-11 on the onvif instance (py-spy, 60 s),
+    this ran for every detection/object pair and was ~74% of avclient's GIL time, inside
+    _motion_lock, which every camera shares. A dozen tiny numpy calls cost 22 us a pair;
+    this is 1.2 us, within one rounding step of it (20,000 random pairs)."""
+    (dx1, dy1), (dx2, dy2) = detection.tolist()
+    (ex1, ey1), (ex2, ey2) = estimate.tolist()
+    ew, eh, dw, dh = ex2 - ex1, ey2 - ey1, dx2 - dx1, dy2 - dy1
+    if not (math.isfinite(ew) and math.isfinite(eh) and math.isfinite(dw)
+            and math.isfinite(dh)) or min(ew, eh, dw, dh) <= 0:
         return float("inf")
-    detection_pos = np.array([np.average(detection[:, 0]), np.max(detection[:, 1])])
-    estimate_pos = np.array([np.average(estimate[:, 0]), np.max(estimate[:, 1])])
-    offset = (detection_pos - estimate_pos).astype(float)
-    offset[0] /= estimate_dim[0]
-    offset[1] /= estimate_dim[1]
-    widths = np.sort([estimate_dim[0], detection_dim[0]])
-    heights = np.sort([estimate_dim[1], detection_dim[1]])
-    change = np.append(offset, [widths[1] / widths[0] - 1.0, heights[1] / heights[0] - 1.0])
-    return float(np.linalg.norm(change))
+    ox = ((dx1 + dx2) / 2 - (ex1 + ex2) / 2) / ew
+    oy = (max(dy1, dy2) - max(ey1, ey2)) / eh
+    return math.hypot(ox, oy, max(ew, dw) / min(ew, dw) - 1.0, max(eh, dh) / min(eh, dh) - 1.0)
 
 
 def _frigate_distance(detection, tracked_object):

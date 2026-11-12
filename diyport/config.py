@@ -355,6 +355,19 @@ def stream_dir(state_dir=None):
     return os.path.join(base, "aiport-streams", key)
 
 
+def make_stream_dir(path):
+    """Create a stream dir. Its aiport-streams parent is shared by every instance on the host,
+    which may run as different users (a root daemon beside a user's agent on macOS), so
+    whichever starts first makes it writable by all, sticky like /tmp."""
+    parent = os.path.dirname(path)
+    try:
+        os.mkdir(parent)
+        os.chmod(parent, 0o1777)
+    except FileExistsError:
+        pass
+    os.makedirs(path, exist_ok=True)
+
+
 def pinned_fw_version(state_dir=None):
     """Firmware version pinned by a simulated UpdateFirmwareRequest, or None.
 

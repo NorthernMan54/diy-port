@@ -22,6 +22,8 @@ import threading
 
 import numpy as np
 
+import envutil
+
 log = logging.getLogger("aiport-enrich")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,24 +48,34 @@ PROTECT_COLORS = {"red", "orange", "yellow", "green", "blue", "purple", "pink", 
                   "black", "white", "gray"}
 COLOR_ALIASES = {"silver": "gray"}
 
-FACE_SCORE_THRESH = float(os.environ.get("AIPORT_FACE_THRESH", "0.8"))
+FACE_SCORE_THRESH = envutil.env_float("AIPORT_FACE_THRESH", 0.8)
 # SFace's published cosine threshold for "same person".
-FACE_MATCH_THRESH = float(os.environ.get("AIPORT_FACE_MATCH_THRESH", "0.363"))
+FACE_MATCH_THRESH = envutil.env_float("AIPORT_FACE_MATCH_THRESH", 0.363)
 # Faces smaller than this (shorter side, snapshot pixels) aren't matched: SFace needs a
 # 112 x 112 face, and tiny crops scored 0.13 to 1.0 against the same person.
-FACE_MATCH_MIN_PX = int(os.environ.get("AIPORT_FACE_MATCH_MIN_PX") or 40)
+FACE_MATCH_MIN_PX = envutil.env_int("AIPORT_FACE_MATCH_MIN_PX", 40)
 # ...nor faces whose SFace vector is shorter than this: length falls with quality, and a weak
 # embedding makes a bad enrolment.
-FACE_EMBED_MIN_NORM = float(os.environ.get("AIPORT_FACE_EMBED_MIN_NORM") or 7.0)
+FACE_EMBED_MIN_NORM = envutil.env_float("AIPORT_FACE_EMBED_MIN_NORM", 7.0)
+
+# A face whose vector is shorter still isn't a face to show at all: the back of a head or a face
+# turned away (live 12:36-12:40 on Driveway: backs of heads 3.3 and 4.3, turned away 5.9; faces
+# 6.7-8.8, in profile too). Dropped once at least FACE_MATCH_MIN_PX, where the length means
+# something. AIPORT_FACE_DROP_NORM=0 keeps them all.
+FACE_DROP_NORM = envutil.env_float("AIPORT_FACE_DROP_NORM", 6.0)
+
+
+def embedding_norm(embedding):
+    return 0.0 if embedding is None else float(np.linalg.norm(np.asarray(embedding, dtype=np.float64)))
 
 
 def weak_embedding(embedding):
     """True if an SFace vector is too short (a poor face) to send or match."""
     return embedding is None or float(np.linalg.norm(np.asarray(embedding, dtype=np.float64))) < FACE_EMBED_MIN_NORM
-PLATE_SCORE_THRESH = float(os.environ.get("AIPORT_LPR_THRESH", "0.5"))
+PLATE_SCORE_THRESH = envutil.env_float("AIPORT_LPR_THRESH", 0.5)
 # Plates narrower than this (snapshot pixels) aren't read: every read under 75 px was wrong.
 # AIPORT_LPR_MIN_PX overrides it.
-PLATE_MIN_PX = int(os.environ.get("AIPORT_LPR_MIN_PX") or 60)
+PLATE_MIN_PX = envutil.env_int("AIPORT_LPR_MIN_PX", 60)
 # Plate/face crops are expanded by this factor around the parent box: the
 # full-res snapshot can lag the 640 detection frame by up to a second.
 CROP_MARGIN = 1.3
@@ -74,7 +86,7 @@ def _flag(name):
     v = os.environ.get(name, "auto").strip().lower()
     if v == "auto":
         return None
-    return v not in ("0", "false", "no", "off")
+    return v not in envutil.OFF
 
 
 def _have(module):
@@ -318,6 +330,11 @@ class Enricher:
                     fx, fy, fw, fh = [float(v) for v in f[:4]]
                     emb = sface.feature(sface.alignCrop(crop, f)) if sface is not None else None
                     size_px = int(min(fw, fh))
+                    if (emb is not None and size_px >= FACE_MATCH_MIN_PX
+                            and embedding_norm(emb) < FACE_DROP_NORM):
+                        log.info("face dropped: %d px, vector length %.1f (back of a head or "
+                                 "turned away)", size_px, embedding_norm(emb))
+                        continue
                     name, sim = (self._match(sface, emb)
                                  if size_px >= FACE_MATCH_MIN_PX and not weak_embedding(emb)
                                  else ("", 0.0))

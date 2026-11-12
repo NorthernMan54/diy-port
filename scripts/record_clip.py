@@ -22,7 +22,13 @@ import subprocess
 import sys
 from datetime import datetime
 
-LOG = os.path.expanduser(os.environ.get("DIYPORT_LOG", "~/diyport.log"))
+# The instance's log (DIYPORT_INSTANCE, "native" if not set; scripts/diyport_paths.sh), or the
+# one in the home folder from before ~/.diy-port.
+_INSTANCE_LOG = os.path.expanduser(
+    f"~/.diy-port/{os.environ.get('DIYPORT_INSTANCE', 'native')}/logs/diyport.log")
+LOG = os.path.expanduser(os.environ.get("DIYPORT_LOG") or (
+    _INSTANCE_LOG if os.path.exists(_INSTANCE_LOG) or "DIYPORT_INSTANCE" in os.environ
+    else "~/diyport.log"))
 OUT_DIR = os.path.expanduser(os.environ.get("DIYPORT_CLIPS", "~/diyport-clips"))
 
 _PULL = re.compile(r"starting merged RTSP pull for deviceID=(\w+): (rtsp://\S+)")

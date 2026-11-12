@@ -33,6 +33,19 @@ def intersection(a, b):
     return (max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3]))
 
 
+def iou_xywh(a, b):
+    """Intersection-over-union of two [x, y, w, h] boxes (Protect's coord); 0 when disjoint."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = min(ax + aw, bx + bw) - max(ax, bx)
+    ih = min(ay + ah, by + bh) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / float(union) if union > 0 else 0.0
+
+
 def box_overlaps(a, b):
     return not (a[2] < b[0] or a[0] > b[2] or a[1] > b[3] or a[3] < b[1])
 
