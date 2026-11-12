@@ -23,6 +23,8 @@ run_all.log
 *.onnx
 *.rknn
 *.tflite
+# OpenVINO compiled-model cache (detectors/openvino.py)
+/diyport/models/openvino_cache/
 /rknn_convert/.venv/
 /rknn_convert/*.whl
 /rknn_convert/bus.jpg

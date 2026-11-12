@@ -21,7 +21,9 @@ import logging
 import math
 import os
 import queue
+import re
 import shutil
+import signal
 import ssl
 import statistics
 import subprocess
@@ -49,6 +51,7 @@ import apple_fm
 import enrich
 import hoststats
 import onvif_push
+import shared_decode
 import onvif_restream
 import regions
 from procutil import start_stderr_drain
@@ -383,6 +386,13 @@ _stream_dims = {}    # deviceID -> (width, height) of the real camera stream
 # _active_streams, which briefly drops a device while its ffmpeg restarts.
 _stream_points = {}
 _stream_probe = {}   # deviceID -> {"codec", "width", "height", "fps"} from ffprobe at pull start
+_stream_source = {}  # deviceID -> (ip, port, uri, url, width, height) of the current pull
+# A reset keeps decoders running for this long; a re-issued UiStreamControl cancels that
+# device's stop, because Protect does not always re-issue after ResetAIPortStreams.
+RESET_GRACE_S = float(os.environ.get("AIPORT_RESET_GRACE_S", "15"))
+_reset_pending = {}
+_reset_lock = threading.Lock()
+_reset_gen = 0
 # deviceID -> exclusion polygons in the normalized 0-1000 space.
 _exclude_zones = {}
 # Prototype app exposes `zones` (not excludeZones): when non-default, a detection must be inside one.
@@ -484,6 +494,7 @@ def send_msg(ws, functionName, payload, to="ubnt_avclient", in_response_to=None,
 
 
 def _stop_stream(device_id):
+    _stream_source.pop(device_id, None)
     proc = _active_streams.pop(device_id, None)
     if proc and proc.poll() is None:
         log.info("stopping RTSP pull for deviceID=%s (pid=%s)", device_id, proc.pid)
@@ -707,64 +718,7 @@ def _shared_decode_source(device_id, url):
     if src.get("url") not in (None, url):
         return None
     fps = src.get("fps") or (_stream_probe.get(device_id) or {}).get("fps") or 20
-    return onvif_push.detect_socket(url), _shared_decode_keep(fps)
-
-
-def _shared_decode_keep(fps):
-    """(keep, of): analyse `keep` of every `of` pushed frames, spread evenly. A whole
-    stride (every Kth frame) can't hit DETECT_FPS from 15 fps: live 2026-11-07 on
-    92DE633106E8 (15 fps) round(15/10) = 2 gave 7.5 fps and a "falling behind" warning
-    every minute. Integers, so ffmpeg's select and the wall-time feeder agree exactly."""
-    of = max(1, int(round(float(fps))))
-    return min(DETECT_FPS, of), of
-
-
-def _shared_decode_keeps(n, keep):
-    """True for input frame n (from 0) that the shared decode analyses: the frames where
-    floor(n * keep / of) steps up (Bresenham), keep of every `of`, evenly spread."""
-    k, of = keep
-    return (n + 1) * k // of > n * k // of
-
-
-def _shared_decode_select(keep):
-    """The ffmpeg select filter for _shared_decode_keeps (n counts input frames from 0)."""
-    k, of = keep
-    return f"select=gt(floor((n+1)*{k}/{of})\\,floor(n*{k}/{of}))"
-
-
-def _feed_shared_decode(device_id, proc, sock_path, keep, walls):
-    """Copies the pushed video1 from its DetectServer into ffmpeg, queueing the wall time
-    of each video frame ffmpeg keeps (_shared_decode_keeps) for the frame reader. Our encoder never reorders frames
-    (allow-frame-reordering=false), so each video tag decodes to one picture, in order."""
-    import socket as socketlib
-    sock = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-    frames = 0
-    try:
-        # The transcode (and its socket) starts after detection: wait for it.
-        for attempt in range(30):
-            try:
-                sock.connect(sock_path)
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                if attempt == 29 or proc.poll() is not None:
-                    raise
-                time.sleep(0.5)
-        f = sock.makefile("rb", buffering=0)
-        for kind, wall, data in onvif_push.read_detect_records(f.read):
-            if kind == onvif_push.DETECT_FRAME:
-                if _shared_decode_keeps(frames, keep):
-                    walls.append(wall)
-                frames += 1
-            proc.stdin.write(data)
-    except (OSError, ValueError) as exc:
-        log.info("shared decode feed for deviceID=%s ended: %r", device_id, exc)
-    finally:
-        sock.close()
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-    log.info("shared decode feed for deviceID=%s ended after %d frames", device_id, frames)
+    return onvif_push.detect_socket(url), shared_decode.keep_ratio(fps, DETECT_FPS)
 
 
 # One ffmpeg pulls RTSP and splits post-decode into a full-res JPEG and an RGB detection
@@ -772,11 +726,16 @@ def _feed_shared_decode(device_id, proc, sock_path, keep, walls):
 def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     """Pull from Protect's relay (ip/port/uri), or from `url` directly -- an
     ONVIF camera's own RTSP URL."""
-    _stop_stream(device_id)
-    config.make_stream_dir(_STREAM_DIR)
-    _stream_dims[device_id] = (width or DETECT_IMG_SIZE, height or DETECT_IMG_SIZE)
     direct = bool(url)
     url = url or f"rtsp://{ip}:{port}/{uri}"
+    source = (str(ip), str(port), str(uri), url, width, height)
+    proc = _active_streams.get(device_id)
+    if proc is not None and proc.poll() is None and _stream_source.get(device_id) == source:
+        return  # Protect re-issued the same stream (reset/reconnect): keep decoding
+    _stop_stream(device_id)
+    _stream_source[device_id] = source
+    config.make_stream_dir(_STREAM_DIR)
+    _stream_dims[device_id] = (width or DETECT_IMG_SIZE, height or DETECT_IMG_SIZE)
     out_path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
     probe = _probe_stream(url)
     _stream_probe[device_id] = probe
@@ -788,10 +747,10 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     det_w, det_h = _detect_dims(width, height)
     rate = input_args = None
     if shared:
-        # Frames picked by count (_shared_decode_keeps), not fps= by timestamp, so each
-        # output frame is a known input frame and takes its wall time (_feed_shared_decode).
+        # Frames picked by count (shared_decode.keeps), not fps= by timestamp, so each
+        # output frame is a known input frame and takes its wall time (shared_decode.feed).
         sock_path, keep = shared
-        codec, rate = "h264", _shared_decode_select(keep)
+        codec, rate = "h264", shared_decode.select_filter(keep)
     pre_args, graph, hw, jpeg_every = _pull_video_args(codec, det_w, det_h, device_id,
                                                        direct=direct, rate=rate)
     if shared:
@@ -824,7 +783,7 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
         os.close(jpeg_w)
     walls = collections.deque()  # shared decode: wall ms of each frame ffmpeg will output
     if shared:
-        threading.Thread(target=_feed_shared_decode, args=(device_id, proc, *shared, walls),
+        threading.Thread(target=shared_decode.feed, args=(device_id, proc, *shared, walls),
                          daemon=True, name=f"shared-decode-{device_id}").start()
     jpeg_pipe = os.fdopen(jpeg_r, "rb")
     stderr_tail = start_stderr_drain(proc)
@@ -3349,47 +3308,49 @@ def _motion_tick(ws, device_id):
 
 
 def _stop_motion_detector(device_id, preserve_tracks=False, ws=None):
-    """Stop this device's poll loop.
+    """Stop this device's poll loop before dropping or preserving its track state.
 
-    ws: the live avclient connection, needed to emit `leave` for open tracks
-    (without one those leaves fail and are only logged).
-
-    preserve_tracks=True keeps `_motion_state` (open tracks, prev_center) so a
-    UiStreamControl refresh does not silently abandon an in-flight track. Only a
-    genuine teardown (stream stop / un-adopt) should discard track state -- and
-    when a track IS discarded with an open event, emit a `leave` first so the
-    controller closes it instead of leaving a dangling event.
+    ws is the live avclient connection, needed for a final `leave`; without it
+    open events can only be dropped with a warning. preserve_tracks=True keeps
+    tracks for a UiStreamControl refresh or ResetAIPortStreams.
     """
-    if not preserve_tracks:
-        with _motion_lock:
-            dev = _motion_state.get(device_id)
-            open_tracks = list((dev or {}).get("tracks", {}).items())
-            _motion_state.pop(device_id, None)
-        # One leave per camera event: participants share its event_id.
-        by_event = {}
-        for tracker_id, tr in open_tracks:
-            if "event_id" in tr:
-                by_event.setdefault(tr["event_id"], []).append((tracker_id, tr))
-        for event_id, members in by_event.items():
-            tracker_id, tr = _leave_track(members)
-            try:
-                _send_smart_detect_event(ws, device_id, edge_type="leave", event_id=event_id,
-                                         stationary=True, object_type=tr["objectType"],
-                                         coord=tr["coord"], confidence=tr["score"],
-                                         first_shown_ms=tr["first_shown_ms"],
-                                         tracker_id=tracker_id)
-                log.info("emitted leave for event %s deviceID=%s (detector stopping)",
-                         event_id, device_id)
-            except Exception:
-                log.exception("failed to emit leave for event %s deviceID=%s", event_id, device_id)
     ev = _motion_poll_stop.pop(device_id, None)
     if ev:
         ev.set()
-    # Join the loop: stop_event is checked only between ticks, so an old thread
-    # could still be inside _motion_tick() and mutate the same track state.
+    # Join before touching tracks: a tick still inside _motion_tick could send an
+    # event after the final leave or mutate the state we are about to drop.
     t = _motion_poll_thread.pop(device_id, None)
     if t and t.is_alive():
         t.join(timeout=MOTION_POLL_INTERVAL_S + 5.0)
+    if preserve_tracks:
+        return
+    with _motion_lock:
+        dev = _motion_state.get(device_id)
+        open_tracks = list((dev or {}).get("tracks", {}).items())
+        _motion_state.pop(device_id, None)
+    if not open_tracks:
+        return
+    if ws is None:
+        log.warning("deviceID=%s: dropping %d open track(s) without a connection for "
+                    "the final leave", device_id, len(open_tracks))
+        return
+    # One leave per camera event: participants share its event_id.
+    by_event = {}
+    for tracker_id, tr in open_tracks:
+        if "event_id" in tr:
+            by_event.setdefault(tr["event_id"], []).append((tracker_id, tr))
+    for event_id, members in by_event.items():
+        tracker_id, tr = _leave_track(members)
+        try:
+            _send_smart_detect_event(ws, device_id, edge_type="leave", event_id=event_id,
+                                     stationary=True, object_type=tr["objectType"],
+                                     coord=tr["coord"], confidence=tr["score"],
+                                     first_shown_ms=tr["first_shown_ms"],
+                                     tracker_id=tracker_id)
+            log.info("emitted leave for event %s deviceID=%s (detector stopping)",
+                     event_id, device_id)
+        except Exception:
+            log.exception("failed to emit leave for event %s deviceID=%s", event_id, device_id)
 
 
 # Per-camera accounting once a minute: delivered, analysed, skipped, inference calls and
@@ -3617,17 +3578,116 @@ def _wait_for_frame(path, timeout=2.0):
     return True
 
 
+# Snapshot uploads go to the controller's camera-upload endpoint. The guard stops a
+# misdirected POST carrying our client certificate and a camera frame.
+SNAPSHOT_URL_GUARD = os.environ.get("AIPORT_SNAPSHOT_URL_GUARD", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+SNAPSHOT_UPLOAD_PORTS = (7444, 6666)
+LIVE_SNAPSHOT_MAX_AGE_S = 5.0
+LIVE_SNAPSHOT_MAX_WIDTH = 1280
+_live_snapshot_slots = threading.BoundedSemaphore(2)
+
+
+def _snapshot_uri_ok(uri, device_info):
+    """True for the controller's exact snapshot endpoint (see protocol.md)."""
+    if not SNAPSHOT_URL_GUARD:
+        return True
+    try:
+        parts = urlsplit(uri)
+    except (TypeError, ValueError):
+        return False
+    if (parts.scheme != "https" or parts.username or parts.password
+            or parts.query or parts.fragment):
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    want = str(device_info.get("console_host") or "").strip().lower()
+    if not want or host != want or port not in SNAPSHOT_UPLOAD_PORTS:
+        return False
+    path = parts.path or ""
+    return bool(re.fullmatch(r"/internal/camera-upload/[A-Za-z0-9._~-]{8,128}", path))
+
+
+def _snapshot_uri_label(uri):
+    """Host and port only: never log a one-use upload token."""
+    try:
+        parts = urlsplit(uri)
+        return f"{parts.scheme}://{parts.hostname}:{parts.port}/internal/camera-upload/<redacted>"
+    except (TypeError, ValueError):
+        return "<invalid-uri>"
+
+
+def _limit_snapshot_width(data, max_width=LIVE_SNAPSHOT_MAX_WIDTH, quality=None):
+    """Re-encode a live snapshot to at most max_width; keep the original on failure."""
+    if not data or len(data) < 4:
+        return data
+    fd, src = tempfile.mkstemp(suffix=".jpg", dir=_tmp_dir())
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        size = _jpeg_size(src)
+        if not size or size[0] <= max_width:
+            return data
+        q = "2" if str(quality or "").lower() == "max" else "5"
+        out = subprocess.run(
+            [FFMPEG_BIN, "-loglevel", "error", "-i", src,
+             "-vf", f"scale={max_width}:-2", "-frames:v", "1", "-q:v", q,
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=15)
+        if out.returncode == 0 and out.stdout.startswith(b"\xff\xd8"):
+            return out.stdout
+        return data
+    except (OSError, subprocess.SubprocessError):
+        return data
+    finally:
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+
 def _upload_snapshot(upload_uri, device_info, requested_filename, what=None,
-                     requested_device_id=None):
+                     requested_device_id=None, quality=None):
     if not upload_uri:
         log.warning("snapshot GetRequest had no uri, nothing to upload")
         return
+    if not _snapshot_uri_ok(upload_uri, device_info):
+        log.warning("refusing snapshot upload to unexpected URI %s",
+                    _snapshot_uri_label(upload_uri))
+        return
+    live = str(what or "").strip().lower() == "snapshot"
+    if live and not _live_snapshot_slots.acquire(blocking=False):
+        log.warning("live snapshot upload slots busy; refusing deviceID=%r",
+                    requested_device_id)
+        return
+    try:
+        _upload_snapshot_image(upload_uri, device_info, requested_filename, what,
+                               requested_device_id, live=live, quality=quality)
+    finally:
+        if live:
+            _live_snapshot_slots.release()
+
+
+def _upload_snapshot_image(upload_uri, device_info, requested_filename, what=None,
+                           requested_device_id=None, *, live=False, quality=None):
     # Resolve filename -> camera and read that camera's frame (never guess from directory contents).
     record, resolved_by = _resolve_snapshot_device(requested_filename, what,
                                                    requested_device_id)
     if record is None:
         return
     device_id = record["device_id"]
+    if live:
+        stamp = _latest_frame_time.get(device_id)
+        age = None if not stamp else time.monotonic() - stamp[1] / 1000.0
+        if age is None or age > LIVE_SNAPSHOT_MAX_AGE_S:
+            log.warning("live snapshot for deviceID=%s is stale (%s s) or missing; refusing",
+                        device_id, "?" if age is None else f"{age:.1f}")
+            return
+        # A live snapshot is the newest full frame, never an object crop.
+        record = {"device_id": device_id, "kind": "fullfov", "coord": None}
     if resolved_by not in ("filename",):
         log.info("snapshot upload for filename=%r (what=%r, deviceID=%r) resolved to "
                   "deviceID=%s via %s", requested_filename, what, requested_device_id,
@@ -3656,6 +3716,8 @@ def _upload_snapshot(upload_uri, device_info, requested_filename, what=None,
             log.warning("snapshot for deviceID=%s is a torn/incomplete JPEG (%d bytes); "
                         "not uploading", device_id, len(data))
             return
+    if live:
+        data = _limit_snapshot_width(data, quality=quality)
     if record["kind"] == "object" and record["coord"]:
         fov_w, fov_h = _stream_dims.get(device_id, (DETECT_IMG_SIZE, DETECT_IMG_SIZE))
         try:
@@ -3680,9 +3742,10 @@ def _upload_snapshot(upload_uri, device_info, requested_filename, what=None,
         resp = requests.post(upload_uri, headers=headers, files=files_form,
                               cert=(CERT_PATH, KEY_PATH), verify=False, timeout=15)
         log.info("uploaded snapshot (%d bytes) from %s to %s -> %s: %s",
-                  len(data), path, upload_uri, resp.status_code, resp.text[:300])
+                  len(data), path, _snapshot_uri_label(upload_uri), resp.status_code,
+                  resp.text[:300])
     except requests.RequestException as e:
-        log.warning("snapshot upload to %s failed: %r", upload_uri, e)
+        log.warning("snapshot upload to %s failed: %r", _snapshot_uri_label(upload_uri), e)
 
 
 def _describe_face_db(path):
@@ -4199,7 +4262,7 @@ def _check_status(ws, now=None):
                 "streaming" if streaming else "not streaming (no frame for %.0f s)" % STATUS_STALE_S,
                 "detecting" if ready else "not detecting (no pass for %.0f s)" % STATUS_STALE_S)
         _send_status_event(ws, device_id, plug=True, streaming=streaming, smart_ready=ready,
-                           audio_ready=True)
+                           audio_ready=AUDIO_EVENT_READY)
 
 
 def _start_status_watch():
@@ -4228,6 +4291,10 @@ def _start_status_watch():
 
     _status_thread = threading.Thread(target=watch, name="camera-status", daemon=True)
     _status_thread.start()
+
+
+# Audio events are not implemented; never advertise readiness for them.
+AUDIO_EVENT_READY = False
 
 
 def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready):
@@ -4358,11 +4425,32 @@ def _onvif_main_size(device_id, payload):
     return payload.get("width"), payload.get("height")
 
 
-def _stop_all_streams(preserve_tracks=False):
+def _stop_one_stream(device_id, preserve_tracks=True, ws=None):
+    _stream_points.pop(device_id, None)
+    # Stop inference first so its leaves go out before the snapshot file is removed.
+    _stop_motion_detector(device_id, preserve_tracks=preserve_tracks, ws=ws)
+    _stop_stream(device_id)
+
+
+def _stop_all_streams(preserve_tracks=False, ws=None):
     for device_id in list(set(_active_streams) | set(_stream_points)):
-        _stream_points.pop(device_id, None)
-        _stop_stream(device_id)
-        _stop_motion_detector(device_id, preserve_tracks=preserve_tracks)
+        _stop_one_stream(device_id, preserve_tracks=preserve_tracks, ws=ws)
+
+
+def _reset_grace_expired(gen):
+    time.sleep(RESET_GRACE_S)
+    with _reset_lock:
+        if gen != _reset_gen:
+            return
+        victims = [d for d, g in _reset_pending.items() if g == gen]
+    for d in victims:
+        # Re-check just before stopping: a start may have arrived while we slept.
+        with _reset_lock:
+            if _reset_pending.get(d) != gen:
+                continue
+            _reset_pending.pop(d, None)
+        log.info("ResetAIPortStreams: grace expired; stopping deviceID=%s", d)
+        _stop_one_stream(d)
 
 
 def _version_from_update_uri(uri):
@@ -4396,6 +4484,9 @@ def handle_function(ws, msg, device_info):
         streaming = bool(payload.get("streaming"))
         if streaming and payload.get("ip") and payload.get("port") and payload.get("uri"):
             try:
+                # A re-issued start cancels this camera's pending reset stop.
+                with _reset_lock:
+                    _reset_pending.pop(device_id, None)
                 # Fresh viewing session: reset the death-retry counter.
                 _stream_restart_count.pop(device_id, None)
                 _start_stream(device_id, payload["ip"], payload["port"], payload["uri"],
@@ -4417,9 +4508,11 @@ def handle_function(ws, msg, device_info):
                 reply_status = "stopped"
         else:
             if device_id:
+                with _reset_lock:
+                    _reset_pending.pop(device_id, None)
                 _stream_points.pop(device_id, None)
-                _stop_stream(device_id)
                 _stop_motion_detector(device_id, ws=ws)
+                _stop_stream(device_id)
             reply_status = "stopped"
         # usedPoints MUST be on every reply (start and stop): without it Protect sets
         # utilization to the maximum and re-pairing fails with estimated_capacity_exceeded.
@@ -4429,7 +4522,7 @@ def handle_function(ws, msg, device_info):
             # smart_ready is the likely gate for AI-task dispatch.
             _send_status_event(ws, device_id, plug=True,
                                 streaming=(reply_status == "started"),
-                                smart_ready=True, audio_ready=True)
+                                smart_ready=True, audio_ready=AUDIO_EVENT_READY)
             if reply_status == "started":
                 _send_feature_flags_event(ws, device_id)
         return
@@ -4441,6 +4534,8 @@ def handle_function(ws, msg, device_info):
         reply_status = "stopped"
         if device_id and payload.get("streaming") and url:
             try:
+                with _reset_lock:
+                    _reset_pending.pop(device_id, None)
                 _stream_restart_count.pop(device_id, None)
                 try:
                     _start_stream(device_id, None, None, None, payload.get("width"),
@@ -4466,14 +4561,16 @@ def handle_function(ws, msg, device_info):
             # Stop, don't forget: Protect often re-issues only streaming:true
             # (not ChangeVideoSettings), and the destinations are still valid.
             _onvif.stop_device(device_id)
+            with _reset_lock:
+                _reset_pending.pop(device_id, None)
             _stream_points.pop(device_id, None)
-            _stop_stream(device_id)
             _stop_motion_detector(device_id, ws=ws)
+            _stop_stream(device_id)
         send_msg(ws, "OnvifStreamControl", {"status": reply_status, "usedPoints": _used_points()},
                  in_response_to=msg_id)
         if device_id and reply_status == "started":
             _send_status_event(ws, device_id, plug=True, streaming=True,
-                               smart_ready=True, audio_ready=True)
+                               smart_ready=True, audio_ready=AUDIO_EVENT_READY)
             _send_feature_flags_event(ws, device_id)
         return
     if fn == "GetStreamList":
@@ -4495,10 +4592,21 @@ def handle_function(ws, msg, device_info):
         send_msg(ws, fn, {"list": result}, in_response_to=msg_id)
         return
     if fn == "ResetAIPortStreams":
-        # The real device stops every stream. Keep track state: Protect re-issues
-        # UiStreamControl right after, and open events should carry on.
-        log.info("ResetAIPortStreams: stopping %d stream(s)", len(_stream_points))
-        _stop_all_streams(preserve_tracks=True)
+        # Keep decoders for a grace window: Protect does not always re-issue a start
+        # after this reset, and open events should carry on.
+        global _reset_gen
+        if RESET_GRACE_S <= 0:
+            log.info("ResetAIPortStreams: stopping %d stream(s)", len(_stream_points))
+            _stop_all_streams(preserve_tracks=True, ws=ws)
+        else:
+            with _reset_lock:
+                _reset_gen += 1
+                gen = _reset_gen
+                for device_id in list(_stream_points):
+                    _reset_pending[device_id] = gen
+            log.info("ResetAIPortStreams: keeping %d stream(s) for %.0fs",
+                     len(_stream_points), RESET_GRACE_S)
+            threading.Thread(target=_reset_grace_expired, args=(gen,), daemon=True).start()
         if msg.get("responseExpected"):
             send_msg(ws, fn, {}, in_response_to=msg_id)
         return
@@ -4564,7 +4672,8 @@ def handle_function(ws, msg, device_info):
         send_msg(ws, "GetRequest", {}, in_response_to=msg_id)
         threading.Thread(target=_upload_snapshot,
                           args=(payload.get("uri"), device_info, payload.get("filename"),
-                                payload.get("what"), payload.get("deviceID")),
+                                payload.get("what"), payload.get("deviceID"),
+                                payload.get("quality")),
                           daemon=True).start()
         return
 
@@ -4616,8 +4725,11 @@ def handle_function(ws, msg, device_info):
         # Un-adopt signal: the controller doesn't close the WS afterward, so tear down here.
         log.info("ResetToDefaults received -- treating as un-adopt: clearing "
                   "adopt state and tearing down streams")
+        with _reset_lock:
+            _reset_pending.clear()
+            _reset_gen += 1
         _onvif.stop_all()
-        _stop_all_streams()
+        _stop_all_streams(ws=ws)
         _exclude_zones.clear()
         _detect_zones.clear()
         _detect_zone_types.clear()
@@ -4828,20 +4940,28 @@ def run(host, port, device_info, token=None):
             },
         }, response_expected=True)
 
-        for raw in ws:
-            _refusals.heard()
-            # Controller sends JSON as BINARY frames; decode bytes as UTF-8 JSON.
-            text = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        try:
+            for raw in ws:
+                _refusals.heard()
+                # Controller sends JSON as BINARY frames; decode bytes as UTF-8 JSON.
+                text = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError:
+                    log.warning("non-JSON frame (%d bytes): %r", len(text), text[:200])
+                    continue
+                if msg.get("inResponseTo"):
+                    log.info("<<< response to our msg id=%s payload=%s",
+                              msg.get("inResponseTo"), msg.get("payload"))
+                    continue
+                handle_function(ws, msg, device_info)
+        except KeyboardInterrupt:
+            log.info("shutdown requested; closing open events before disconnect")
             try:
-                msg = json.loads(text)
-            except json.JSONDecodeError:
-                log.warning("non-JSON frame (%d bytes): %r", len(text), text[:200])
-                continue
-            if msg.get("inResponseTo"):
-                log.info("<<< response to our msg id=%s payload=%s",
-                          msg.get("inResponseTo"), msg.get("payload"))
-                continue
-            handle_function(ws, msg, device_info)
+                _stop_all_streams(ws=ws)
+            except Exception:
+                log.exception("failed to close open events on shutdown")
+            raise
 
 
 def _init_detector(cfg):
@@ -4862,6 +4982,12 @@ def _init_detector(cfg):
 
 def main():
     cfg = config.load_config_and_logging(sys.argv[1:])
+
+    def _term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
+
     ap = argparse.ArgumentParser(description=__doc__)
     config.add_common_flags(ap)
     ap.add_argument("--iface", default=None,
@@ -4987,6 +5113,9 @@ def main():
         try:
             run(host, port, device_info, token=token if send_token else None)
             log.warning("classic avclient connection closed cleanly by peer")
+        except KeyboardInterrupt:
+            log.info("shutdown requested; exiting")
+            return
         except Exception as e:
             log.warning("classic avclient connection ended: %r", e)
         _refusals.ended(bool(token or hosts))

@@ -114,11 +114,13 @@ as `extendedFlv`, while the AI Port also pulls the camera's RTSP for detection.
 | Raspberry Pi 4 | BCM2711 | Verified | `docker/` image; H.264 hardware decode bare-metal only |
 | x86_64 server / PC | amd64 | Verified | `docker/` CPU image; no NPU |
 | Apple-silicon Mac | M-series | Verified | Bare metal only (Docker Desktop has no LAN L2); Core ML on the Neural Engine |
+| Intel x86_64 (iGPU / Arc / Core Ultra NPU) | `openvino` | Detector verified, not yet against a console | `--accel openvino` or the `ACCEL=openvino` image; YOLOv5n ~13 ms/frame on a 12th-gen Iris Xe iGPU (vs ~33 ms for the `cpu` backend on the same host), bare metal and Docker; NPU path untested |
 | Any Linux CPU host | `onnxruntime` | Untested | `--accel cpu`; fine for a camera or two |
 
 The detector is pluggable (`diyport/detectors/`, `[hardware] detector` in
-`aiport.cfg`): `rknn`, `edgetpu`, `cpu`, or `auto`, which takes the first one
-whose runtime, hardware and model are present. A new accelerator is a
+`aiport.cfg`): `rknn`, `edgetpu`, `openvino`, `cpu`, or `auto`, which takes the
+first one whose runtime, hardware and model are present, in that order. A new
+accelerator is a
 `base.Detector` subclass registered in `BACKENDS` (and `AUTO_ORDER` for `auto`)
 in `diyport/detectors/__init__.py`.
 
@@ -161,7 +163,8 @@ in `diyport/detectors/__init__.py`.
   the Edge TPU or CPU path; **or** an Apple-silicon Mac bare metal for the
   Core ML/CPU path.
 - The backend's runtime: `rknn-toolkit-lite2` (NPU), `ai-edge-litert` +
-  `libedgetpu` (Coral), or `onnxruntime` (CPU/Core ML). `install.sh` installs
+  `libedgetpu` (Coral), `openvino` + Intel's GPU compute runtime (Intel
+  GPU/NPU), or `onnxruntime` (CPU/Core ML). `install.sh` installs
   only the selected backend; Docker builds it into the image.
 - A UniFi Protect console you own and control, on the same LAN (except the
   same-host Docker bridge setup).
@@ -180,7 +183,7 @@ diyport/               the emulator
   http_api.py           HTTPS :443 adopt/control API
   ucp4_client.py        generic ucp4 device-management websocket
   avclient.py           pairing/streaming/smart-detect websocket + detection
-  detectors/            pluggable detector backends (rknn / edgetpu / cpu)
+  detectors/            pluggable detector backends (rknn / edgetpu / openvino / cpu)
   enrich.py / facedb.py optional plates, faces and vehicle attributes
   motion.py / regions.py / stationary.py / norfair_match.py   Frigate-derived detection
   replay.py             offline clip replay and scenario checks
@@ -221,8 +224,9 @@ sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
 
 - Run from the checkout root, as root. `--parent-iface` defaults to the
   auto-detected default-route NIC.
-- `--accel auto|rknn|edgetpu|cpu|none` picks the detector backend (default
-  `auto`: rknn on an RK3588, edgetpu when a Coral is present, else cpu) and
+- `--accel auto|rknn|edgetpu|openvino|cpu|none` picks the detector backend
+  (default `auto`: rknn on an RK3588, edgetpu when a Coral is present, openvino
+  on an x86_64 host with an Intel GPU/NPU, else cpu) and
   installs only that backend's runtime and model. `--no-npu` is an alias for
   `--accel none`.
 - The NPU model cannot be built on the Pi; build it on an x86 host
@@ -265,12 +269,45 @@ sudo scripts/install.sh --console <console-ip> --accel edgetpu
 For the same Pi 5 running the console in Docker, use the bridge setup instead
 (see [Docker (console on the same host)](#docker-console-on-the-same-host)).
 
+### Intel GPU / NPU (OpenVINO)
+
+`install.sh --accel openvino` (x86_64) installs `openvino`, the YOLOv5n ONNX
+model (the same file as `cpu`), and, when an Intel GPU is present, the OpenCL
+compute runtime that OpenVINO's GPU plugin needs. That runtime is the distro's
+`intel-opencl-icd` where apt has it (Ubuntu, Debian bookworm), else Intel's
+sha256-pinned `compute-runtime` + IGC release debs (Debian trixie dropped the
+package). It then writes `[hardware] detector = openvino`:
+
+```bash
+sudo scripts/install.sh --console <console-ip> --accel openvino
+python3 scripts/detector_check.py --backend openvino --image bus.jpg --expect person   # quick check
+```
+
+- `AIPORT_OV_DEVICE` picks the device: `auto` (default) takes the first GPU,
+  then an NPU, then the CPU. `GPU`, `GPU.1`, `NPU`, `CPU` or OpenVINO's own
+  `AUTO:GPU,CPU` pin one. A device that can't compile the model falls back to
+  the CPU, with the error logged.
+- The first start compiles the model for the GPU (~2 s on an Iris Xe); the
+  result is cached in `diyport/models/openvino_cache` (`AIPORT_OV_CACHE_DIR`),
+  so later starts load in ~0.2 s.
+- The Core Ultra NPU also needs Intel's user-space driver
+  ([intel/linux-npu-driver](https://github.com/intel/linux-npu-driver)) and a
+  kernel with `intel_vpu`; the installer doesn't set these up.
+- `auto` only picks `openvino` when an Intel GPU (`/dev/dri/renderD*`, vendor
+  `0x8086`) or NPU (`/dev/accel/accel*`) is visible. On a plain CPU,
+  `detector = openvino` still works, on OpenVINO's CPU plugin.
+- `detector_model` takes any model the `cpu` backend does (Ultralytics YOLOv5,
+  Rockchip raw heads, anchor-free YOLOv8/v9/v11 ONNX) or an OpenVINO IR `.xml`
+  (with its `.bin` next to it). A GPU has the headroom for a bigger model than
+  `yolov5n`.
+
 ### x86 / Raspberry Pi (CPU Docker) and Komodo
 
 `docker/` builds one image for `linux/amd64` and `linux/arm64` (Pi 4/5); the
-detector backend is selected at build time (`ACCEL=cpu` by default, or
-`edgetpu`). The repo-root `compose.yaml` is the single-instance stack (host
-networking) and the **Komodo** Stack file:
+detector backend is selected at build time (`ACCEL=cpu` by default,
+`edgetpu`, or `openvino` for an Intel GPU on amd64; pass `/dev/dri` in, see
+the commented `devices:` in `compose.yaml`). The repo-root `compose.yaml` is
+the single-instance stack (host networking) and the **Komodo** Stack file:
 
 ```bash
 docker build -f docker/Dockerfile -t diyport-cpu .
@@ -379,7 +416,8 @@ docker compose up -d --build
 ```
 
 The default backend is Coral (`AIPORT_ACCEL=edgetpu`); set `AIPORT_ACCEL=cpu`
-or `none` to build a CPU image instead. Device identity and state persist in the
+or `none` to build a CPU image instead, or `openvino` for an Intel GPU (and
+uncomment its `devices:` in `docker/docker-compose.yml`). Device identity and state persist in the
 `aiport-data` volume. The trade-off: the AI Port lives on the Docker subnet
 (default `172.30.10.0/24`), so only that host can reach it. See
 [`docker/README.md`](docker/README.md).
@@ -387,8 +425,8 @@ or `none` to build a CPU image instead. Device identity and state persist in the
 ### Manual install
 
 ```bash
-python3 scripts/fetch_models.py --backend cpu    # or --backend edgetpu / rknn assets
-pip install -r diyport/requirements.txt           # + rknn-toolkit-lite2 / ai-edge-litert / onnxruntime
+python3 scripts/fetch_models.py --backend cpu    # or --backend edgetpu / openvino / rknn assets
+pip install -r diyport/requirements.txt           # + rknn-toolkit-lite2 / ai-edge-litert / openvino / onnxruntime
 $EDITOR diyport/aiport.cfg                        # identity, console IP, [hardware] detector
 sudo python3 diyport/run_all.py --iface <iface>
 ```
@@ -510,12 +548,12 @@ Limits:
 
 Each backend needs an open model. Because the binaries are large and
 reproducible, they are not committed; `scripts/fetch_models.py` downloads them
-(`--backend rknn|edgetpu|cpu`), sha256-pinned where a single file:
+(`--backend rknn|edgetpu|openvino|cpu`), sha256-pinned where a single file:
 
 | Asset | Used by | Source |
 | --- | --- | --- |
 | `ssdlite_mobiledet_coco_qat_postprocess_edgetpu.tflite` (5.1 MiB) | `edgetpu` backend | Google Coral test data (Apache-2.0), the model Frigate ships: <https://github.com/google-coral/test_data> (`release-frogfish`) |
-| `yolov5n.onnx` (3.8 MiB) | `cpu` / Core ML backend | Ultralytics YOLOv5 `v7.0` release (AGPL-3.0): <https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx> |
+| `yolov5n.onnx` (3.8 MiB) | `cpu` / Core ML and `openvino` backends | Ultralytics YOLOv5 `v7.0` release (AGPL-3.0): <https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx> |
 | `yolov5s_relu.onnx` (27.6 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
 | anchors, COCO labels, bus.jpg, calibration subset | RKNN conversion | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
 
@@ -569,12 +607,29 @@ Device identity, network mode, the console address and the detector live in
 | `[identity] device_id` | UUID in `aiport.cfg` | Persistent device UUID; `instance_manager.py`/the container entrypoint generate a unique one per instance |
 | `[network] iface` / `mode` / `ip` | auto / `dhcp` / - | Interface to bind, and `dhcp` or `static` addressing |
 | `[console] host` / `port` | - / `7442` | The Protect console to dial when not yet adopted |
-| `[hardware] detector` | `auto` | `auto`, `rknn`, `edgetpu`, `cpu` or `none` (env `AIPORT_DETECTOR`) |
+| `[hardware] detector` | `auto` | `auto`, `rknn`, `edgetpu`, `openvino`, `cpu` or `none` (env `AIPORT_DETECTOR`) |
 | `[hardware] detector_model` | - | Model file for that backend; blank = its default in `models/` (env `AIPORT_MODEL_PATH`) |
 
 Detector/runtime environment overrides: `AIPORT_DETECTOR`, `AIPORT_MODEL_PATH`,
-`AIPORT_OBJ_THRESH`, `AIPORT_HWDEC`, `AIPORT_HW_SCALE`, `AIPORT_FRAME_JPEG_FPS`, `AIPORT_ORT_INTRA_THREADS`, `AIPORT_ORT_PROVIDER`, `AIPORT_TICK_S`, `AIPORT_DETECT_FPS`, `AIPORT_CONFIRM_MS`, `AIPORT_MISS_S`, `AIPORT_TRUE_THRESH`, `AIPORT_CROSS_TYPE_IOU`, `AIPORT_RESUME_S`, `AIPORT_BOX_DELAY_MS`, `AIPORT_LPR`, `AIPORT_FACE`,
-`AIPORT_MOTION_GATE` / `AIPORT_MOTION_THRESHOLD` / `AIPORT_MOTION_CONTOUR_AREA`, `AIPORT_REGIONS` / `AIPORT_DETECT_SIZE`, `AIPORT_TRACKER`, `AIPORT_LENS_FILTER` / `AIPORT_LENS_MIN_HEIGHT` (see `diyport/README.md`), `AIPORT_MIN_INITIALIZED`, `AIPORT_MOTION_GATE_THRESH`, `AIPORT_VEHICLE_ATTRS`, `AIPORT_VEHICLE_FM`, `AIPORT_LPR_MIN_PX`, `AIPORT_LPR_THRESH`, `AIPORT_FACE_THRESH`, `AIPORT_FACE_DB_THRESH`, `AIPORT_FACES_DIR`, `AIPORT_FACES_SEEN_DIR`, `AIPORT_HOST_STATS`, `AIPORT_POINTS_SCALE`, `AIPORT_STREAM_STALL_S`, `AIPORT_RTSP_TIMEOUT_S`, `AIPORT_ADVERTISE_IP`, `AIPORT_CAMERA_CLOCK`, `AIPORT_CLOCK_WALL_SKEW_MS`.
+`AIPORT_OBJ_THRESH`, `AIPORT_HWDEC`, `AIPORT_HW_SCALE`, `AIPORT_FRAME_JPEG_FPS`,
+`AIPORT_ORT_INTRA_THREADS`, `AIPORT_ORT_PROVIDER`, `AIPORT_OV_DEVICE`, `AIPORT_OV_CACHE_DIR`,
+`AIPORT_TICK_S`, `AIPORT_DETECT_FPS`,
+`AIPORT_CONFIRM_MS`, `AIPORT_MISS_S`, `AIPORT_TRUE_THRESH`, `AIPORT_CROSS_TYPE_IOU`, `AIPORT_RESUME_S`,
+`AIPORT_MIN_INITIALIZED`, `AIPORT_BOX_DELAY_MS`, `AIPORT_MOTION_GATE` /
+`AIPORT_MOTION_THRESHOLD` / `AIPORT_MOTION_CONTOUR_AREA` / `AIPORT_MOTION_GATE_THRESH`,
+`AIPORT_REGIONS` / `AIPORT_DETECT_SIZE`, `AIPORT_TRACKER`, `AIPORT_LENS_FILTER` /
+`AIPORT_LENS_MIN_HEIGHT`, `AIPORT_SNAPSHOT_URL_GUARD` (default on; 0 disables the
+controller-upload target check), `AIPORT_RESET_GRACE_S` (default 15 s; 0 stops
+streams immediately on `ResetAIPortStreams`).
+
+Enrichment: `AIPORT_VEHICLE_ATTRS`, `AIPORT_VEHICLE_FM`, `AIPORT_LPR` /
+`AIPORT_LPR_MIN_PX` / `AIPORT_LPR_THRESH`, `AIPORT_FACE` / `AIPORT_FACE_THRESH` /
+`AIPORT_FACE_MATCH_*` / `AIPORT_FACE_EMBED_MIN_*` / `AIPORT_FACE_DB_THRESH`,
+`AIPORT_FACES_DIR` / `AIPORT_FACES_SEEN_DIR`.
+
+Host and operations: `AIPORT_HOST_STATS`, `AIPORT_POINTS_SCALE`, `AIPORT_STREAM_STALL_S`,
+`AIPORT_RTSP_TIMEOUT_S`, `AIPORT_ADVERTISE_IP` (NAT/Docker), and the experimental
+`AIPORT_CAMERA_CLOCK` / `AIPORT_CLOCK_WALL_SKEW_MS`. Details in `diyport/README.md`.
 The old `AIPORT_BACKEND=auto|rknn|onnx` name is still accepted (`onnx` = `cpu`).
 `AIPORT_ORT_PROVIDER` is `auto` by default (Core ML when onnxruntime offers it, else
 CPU); `cpu` forces CPU and `coreml` requests Core ML (CPU with a warning if absent).

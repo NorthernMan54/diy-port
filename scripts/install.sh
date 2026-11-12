@@ -26,6 +26,16 @@ DEFAULT_RKNN_SHA256="f4fd0122ecca3117323b8268d270e6cc293e364d6a9dda8e83293d64c83
 # 2.3.0); sha256 per <distro>_<arch> from the release digests.
 LIBEDGETPU_TAG="16.0TF2.19.1-1"
 LIBEDGETPU_VER="16.0tf2.19.1-1"
+# Intel GPU runtime for OpenVINO where apt has no intel-opencl-icd (trixie):
+# compute-runtime 26.35.39758.10 + IGC v2.41.5, sha256-pinned; amd64 only.
+NEO_TAG="26.35.39758.10"
+IGC_TAG="v2.41.5"
+declare -A NEO_DEBS=(
+    ["https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-core-2_2.41.5+22716_amd64.deb"]="0a6e64a663ae65a0fa02d6912ae3b6b37cf85b90c21cc423fd9fef70aaf4f628"
+    ["https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-opencl-2_2.41.5+22716_amd64.deb"]="779e1b9e88098eb25711e9a8f67c2752665bad22f134aa40ed5649f6e1b87058"
+    ["https://github.com/intel/compute-runtime/releases/download/${NEO_TAG}/intel-opencl-icd_${NEO_TAG}-0_amd64.deb"]="61712caaddeba3d38e4f79e2a0fb23fea25596ca2d72c3144c6eea2331ec4301"
+    ["https://github.com/intel/compute-runtime/releases/download/${NEO_TAG}/libigdgmm12_22.10.0_amd64.deb"]="6031a63d6e8a12ce61c14efc15f2c8e727061286e3820b8594e6d00615e04d54"
+)
 declare -A LIBEDGETPU_SHA256=(
     [bookworm_amd64]=23be53c72eff4d44afc2f727700da185791d3ca0867bd0b5e082ec3a0de21925
     [bookworm_arm64]=46ab47310d6de120bda4678febe5eb6143f5c7d7dd17c0d017ae5f6cd67dfec5
@@ -66,8 +76,9 @@ Usage: sudo scripts/install.sh --console <UNVR-IP> [options]
   --console HOST[:PORT]   UniFi Protect console address (written to aiport.cfg)
   --parent-iface IFACE    NIC the macvlan instance is built on (alias --iface)
   --name NAME             instance name (default: main)
-  --accel BACKEND         detector backend: auto|rknn|edgetpu|cpu|none
-                          (auto: rknn on RK3588, edgetpu with a Coral, else cpu)
+  --accel BACKEND         detector backend: auto|rknn|edgetpu|openvino|cpu|none
+                          (auto: rknn on RK3588, edgetpu with a Coral, openvino
+                          with an Intel GPU/NPU on x86_64, else cpu)
   --rknn PATH             prebuilt yolov5s_relu.rknn to install
   --rknn-url URL          download the .rknn from URL (overrides DIYPORT_RKNN_URL)
   --rknn-sha256 HEX       verify a downloaded/supplied .rknn
@@ -112,6 +123,18 @@ coral_present() {
     [ -e /dev/apex_0 ]
 }
 
+# Same check as detectors/openvino.py: an Intel (0x8086) render node or NPU
+# with its /dev node present. $1 = drm (GPU) or accel (NPU).
+intel_accel_present() {
+    local d dev
+    case "$1" in drm) dev=/dev/dri ;; accel) dev=/dev/accel ;; esac
+    for d in /sys/class/"$1"/*; do
+        case "$(basename "$d")" in renderD*|accel[0-9]*) ;; *) continue ;; esac
+        [ "$(cat "$d/device/vendor" 2>/dev/null)" = "0x8086" ] && [ -e "$dev/$(basename "$d")" ] && return 0
+    done
+    return 1
+}
+
 ARCH="$(uname -m)"
 case "$ACCEL" in
     auto)
@@ -119,12 +142,14 @@ case "$ACCEL" in
             ACCEL="rknn"
         elif coral_present; then
             ACCEL="edgetpu"
+        elif [ "$ARCH" = "x86_64" ] && { intel_accel_present drm || intel_accel_present accel; }; then
+            ACCEL="openvino"
         else
             ACCEL="cpu"
         fi
         log "auto-detected detector backend: $ACCEL" ;;
-    rknn|edgetpu|cpu|none) ;;
-    *) die "invalid --accel '$ACCEL' (auto|rknn|edgetpu|cpu|none)" ;;
+    rknn|edgetpu|openvino|cpu|none) ;;
+    *) die "invalid --accel '$ACCEL' (auto|rknn|edgetpu|openvino|cpu|none)" ;;
 esac
 if [ "$ACCEL" = "rknn" ] && [ "$ARCH" != "aarch64" ]; then
     die "--accel rknn needs an aarch64 RK3588 board, got $ARCH; use --accel cpu or edgetpu (the Docker stack is in docker/README.md)"
@@ -136,6 +161,11 @@ if [ "$ACCEL" = "edgetpu" ]; then
         *) die "--accel edgetpu supports aarch64/x86_64, got $ARCH" ;;
     esac
     coral_present || warn "no Coral found on USB (or /dev/apex_0); installing anyway -- plug it in before starting"
+fi
+if [ "$ACCEL" = "openvino" ]; then
+    [ "$ARCH" = "x86_64" ] || die "--accel openvino needs an x86_64 Intel host, got $ARCH; use --accel cpu"
+    intel_accel_present drm || intel_accel_present accel \
+        || warn "no Intel GPU (/dev/dri) or NPU (/dev/accel) found; OpenVINO will run on the CPU"
 fi
 
 log "installing system packages"
@@ -154,10 +184,11 @@ log "installing Python dependencies"
 case "$ACCEL" in
     rknn)    log "installing rknn-toolkit-lite2"; "$PY" -m pip install --quiet rknn-toolkit-lite2 ;;
     edgetpu) log "installing ai-edge-litert";     "$PY" -m pip install --quiet ai-edge-litert ;;
+    openvino) log "installing openvino";          "$PY" -m pip install --quiet openvino ;;
     cpu)     log "installing onnxruntime";        "$PY" -m pip install --quiet onnxruntime ;;
 esac
 
-if [ "$ACCEL" = "edgetpu" ] || [ "$ACCEL" = "cpu" ]; then
+if [ "$ACCEL" = "edgetpu" ] || [ "$ACCEL" = "openvino" ] || [ "$ACCEL" = "cpu" ]; then
     log "fetching the $ACCEL model (binaries are gitignored)"
     "$PY" "$REPO_ROOT/scripts/fetch_models.py" --backend "$ACCEL"
 fi
@@ -186,6 +217,27 @@ if [ "$ACCEL" = "edgetpu" ]; then
         rm -rf "$tmpdir"
         # Its udev rule only applies on (re)plug; trigger so a Coral already in works now.
         udevadm control --reload-rules && udevadm trigger || true
+    fi
+fi
+
+if [ "$ACCEL" = "openvino" ] && intel_accel_present drm; then
+    # OpenVINO's GPU plugin runs on OpenCL: Intel's compute runtime (NEO) + IGC.
+    if { dpkg-query -W -f='${Status}\n' intel-opencl-icd 2>/dev/null || true; } \
+            | grep -q "install ok installed"; then
+        log "intel-opencl-icd already installed"
+    elif apt-cache show intel-opencl-icd >/dev/null 2>&1; then
+        log "installing intel-opencl-icd (Intel GPU compute runtime)"
+        apt-get install -y -qq --no-install-recommends intel-opencl-icd
+    else
+        log "installing Intel compute-runtime ${NEO_TAG} (no intel-opencl-icd in apt)"
+        tmpdir="$(mktemp -d)"
+        for url in "${!NEO_DEBS[@]}"; do
+            deb="$tmpdir/$(basename "$url")"
+            curl -fsSL -o "$deb" "$url" || die "failed to download $url"
+            verify_sha256 "$deb" "${NEO_DEBS[$url]}" || die "$(basename "$url") failed sha256 verification"
+        done
+        apt-get install -y -qq --no-install-recommends "$tmpdir"/*.deb
+        rm -rf "$tmpdir"
     fi
 fi
 
@@ -442,5 +494,9 @@ case "$ACCEL" in
              echo "rkmpp build for hardware H.264 decode." ;;
     edgetpu) echo "Note: a USB Coral is fastest on a USB 3 port; if it ever fails to open"
              echo "(\"Failed to load delegate\"), unplug and replug it." ;;
+    openvino) echo "Note: OpenVINO picks the Intel GPU, then the NPU, then the CPU; set"
+              echo "AIPORT_OV_DEVICE=GPU|NPU|CPU to pin one. The first start compiles the"
+              echo "model for the GPU (a few seconds); later starts load it from the cache."
+              intel_accel_present accel && echo "The NPU also needs intel/linux-npu-driver (not installed here)." ;;
     none)    echo "Note: no detector backend installed; detection is disabled." ;;
 esac

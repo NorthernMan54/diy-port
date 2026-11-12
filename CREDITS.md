@@ -46,6 +46,14 @@ Third-party projects this repository references, derives from, or vendors. See
   installs its `libedgetpu1-std` package for the `edgetpu` backend.
 - **[ai-edge-litert](https://pypi.org/project/ai-edge-litert/)** (Apache-2.0) -
   Google's TFLite runtime, which loads the Edge TPU delegate.
+- **[OpenVINO](https://github.com/openvinotoolkit/openvino)** (Apache-2.0) -
+  Intel's inference runtime for the `openvino` backend (GPU/NPU/CPU plugins).
+- **Intel GPU compute runtime**:
+  [intel/compute-runtime](https://github.com/intel/compute-runtime) (MIT),
+  [intel/intel-graphics-compiler](https://github.com/intel/intel-graphics-compiler)
+  (MIT) and [intel/gmmlib](https://github.com/intel/gmmlib) (MIT). The OpenCL
+  stack OpenVINO's GPU plugin runs on. `install.sh` and the `ACCEL=openvino`
+  image install Intel's release debs where the distro lacks `intel-opencl-icd`.
 - **onnxruntime** (MIT), **numpy** (BSD-3-Clause), **requests** (Apache-2.0),
   **websockets** (BSD-3-Clause), **paramiko** (LGPL-2.1) - Python runtime
   dependencies. **ffmpeg** (LGPL-2.1-or-later or GPL depending on the build) is

@@ -15,13 +15,15 @@ import os
 
 from .cpu import CpuDetector
 from .edgetpu import EdgeTpuDetector
+from .openvino import OpenVinoDetector
 from .rknn import RknnDetector
 
 log = logging.getLogger("aiport-detector")
 
-BACKENDS = {cls.NAME: cls for cls in (RknnDetector, EdgeTpuDetector, CpuDetector)}
+BACKENDS = {cls.NAME: cls for cls in (RknnDetector, EdgeTpuDetector, OpenVinoDetector,
+                                      CpuDetector)}
 # Fastest first; cpu is the fallback that works everywhere.
-AUTO_ORDER = ("rknn", "edgetpu", "cpu")
+AUTO_ORDER = ("rknn", "edgetpu", "openvino", "cpu")
 
 
 def probe(model_path=None):
@@ -37,7 +39,8 @@ def resolve(name="auto", model_path=None):
     if name == "auto" and model_path:
         # An explicit model decides the backend, as the pre-modular detector did.
         ext = os.path.splitext(model_path)[1].lower()
-        name = {".rknn": "rknn", ".tflite": "edgetpu", ".onnx": "cpu"}.get(ext, "auto")
+        name = {".rknn": "rknn", ".tflite": "edgetpu", ".xml": "openvino",
+                ".onnx": "cpu"}.get(ext, "auto")
     if name != "auto":
         if name not in BACKENDS:
             raise ValueError(f"unknown detector {name!r}; choose from auto, {', '.join(BACKENDS)}")

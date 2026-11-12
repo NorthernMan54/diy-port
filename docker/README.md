@@ -7,6 +7,7 @@ x86_64) with a detector backend baked in at build time:
 | --- | --- | --- |
 | `cpu` (image build default) | `onnxruntime` (YOLOv5n) | No accelerator; works on any x86_64/arm64 host |
 | `edgetpu` | Coral USB/PCIe (`ai-edge-litert` + `libedgetpu`) | SSDLite MobileDet, sha256-pinned; bridge stack default; USB Coral verified on a Pi 5 |
+| `openvino` | Intel iGPU/Arc/NPU (`openvino` + Intel compute runtime) | amd64 only; YOLOv5n; needs `--device /dev/dri`; see [Intel GPU / NPU](#intel-gpu--npu-openvino) |
 | `none` | detection off | Protocol stack only |
 
 The RK3588 NPU backend is not offered in the image - use `scripts/install.sh`
@@ -78,7 +79,7 @@ Hikvision 4K ONVIF camera (video push, live view, recording, detection).
 | `AIPORT_CONSOLE` | required | Container env: console `host[:port]` (port defaults to 7442) |
 | `AIPORT_HOSTNAME` | `diyport` | Container env: advertised hostname |
 | `AIPORT_DEBUG` | `false` | Container env: debug logging |
-| `AIPORT_DETECTOR` | image `ACCEL` | Container env: detector backend override (`cpu`/`edgetpu`/`none`) |
+| `AIPORT_DETECTOR` | image `ACCEL` | Container env: detector backend override (`cpu`/`edgetpu`/`openvino`/`none`) |
 | `AIPORT_ACCEL` | `edgetpu` | Compose build arg: detector baked into the image |
 | `AIPORT_IP` / `AIPORT_SUBNET` | `172.30.10.10` / `172.30.10.0/24` | Compose interpolation: container address/subnet; keep the IP fixed, the console stores it |
 
@@ -219,7 +220,7 @@ docker buildx build \
 On a Pi, a plain `docker build` is native arm64. Cross-building arm64 elsewhere
 needs QEMU/binfmt (`docker run --privileged --rm tonistiigi/binfmt --install arm64`).
 For Coral, use `--build-arg ACCEL=edgetpu` (the libedgetpu package is
-sha256-pinned per arch).
+sha256-pinned per arch). For an Intel GPU, `--build-arg ACCEL=openvino` (amd64).
 
 ## State and identity
 
@@ -254,6 +255,29 @@ device number once libedgetpu loads its firmware. The image pins the same
 Only the USB Coral is handled. A PCIe/M.2 Coral additionally needs the
 `gasket`/`apex` kernel driver. A PCIe Coral shows up as `/dev/apex_0` and is
 detected by the backend/web UI, but the driver is not installed by this image.
+
+## Intel GPU / NPU (OpenVINO)
+
+```bash
+docker build -f docker/Dockerfile --build-arg ACCEL=openvino -t diyport-openvino .
+docker run --rm --device /dev/dri -v "$PWD/bus.jpg:/bus.jpg:ro" --entrypoint python3 \
+    diyport-openvino scripts/detector_check.py --image /bus.jpg --expect person   # quick check
+```
+
+Debian trixie (the base image) has no `intel-opencl-icd`, so the image installs
+Intel's compute-runtime `26.35.39758.10` and IGC `v2.41.5` release debs,
+sha256-pinned, the same as `install.sh`. Pass the GPU in with
+`--device /dev/dri` (in compose, the commented `devices:` entries in
+`compose.yaml` / `docker/docker-compose.yml`). Without it the backend runs on
+OpenVINO's CPU plugin, and `detector_check.py` reports `on CPU`. A Core Ultra NPU
+also needs `--device /dev/accel` and Intel's NPU user-space driver, which the
+image does not include. The compiled-model cache lives in
+`/data/openvino_cache`, so a recreated container skips the ~2 s GPU compile.
+
+Verified with Podman on an i5-1240P (Iris Xe): the image builds, `run_all.py`
+logs `OpenVINO detector initialized (... device=GPU [Intel(R) Iris(R) Xe
+Graphics (iGPU)] ...)`, and `detect()` takes ~13 ms/frame. Not yet run against
+a Protect console.
 
 ## Confirmed vs. untested
 

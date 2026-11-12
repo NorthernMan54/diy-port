@@ -8,6 +8,8 @@ numpy
 #     (see diyport/README.md for the matching librknnrt.so upgrade it requires)
 #   * Coral Edge TPU (USB/PCIe): pip install ai-edge-litert
 #     (plus libedgetpu1-std -- scripts/install.sh or docker/ installs it)
+#   * Intel iGPU / Arc GPU / Core Ultra NPU (x86_64): pip install openvino
+#     (plus the GPU compute runtime / NPU driver -- see diyport/README.md)
 #   * CPU/Core ML (x86_64 / arm64, Apple-silicon macOS): pip install onnxruntime
 # detectors/ selects whichever backend is configured/present ([hardware] detector
 # or AIPORT_DETECTOR; AIPORT_BACKEND is the legacy spelling).

@@ -53,7 +53,7 @@ DEFAULTS = {
     "host": "",  # set to your controller's IP
     "port": "7442",
     # [hardware]
-    "detector": "auto",         # auto | rknn | edgetpu | cpu | none (see detectors/)
+    "detector": "auto",         # auto | rknn | edgetpu | openvino | cpu | none (see detectors/)
     "detector_model": "",       # blank = the backend's default model in models/
     # [logging]
     "debug": "false",

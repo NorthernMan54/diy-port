@@ -14,6 +14,9 @@
 # Coral: /dev/bus/usb is bind-mounted (not passed as one --device) because the
 # USB Coral re-enumerates with a new device number once libedgetpu loads its
 # firmware; the cgroup rule allows the USB character devices (major 189).
+#
+# Intel GPU/NPU (OpenVINO): AIPORT_ACCEL=openvino, and uncomment the devices:
+# entries below.
 name: diyport
 
 services:
@@ -37,6 +40,9 @@ services:
       - /dev/bus/usb:/dev/bus/usb
     device_cgroup_rules:
       - "c 189:* rmw"
+    # devices:
+    #   - /dev/dri:/dev/dri       # Intel iGPU/Arc (AIPORT_ACCEL=openvino)
+    #   - /dev/accel:/dev/accel   # Core Ultra NPU (also needs the NPU driver on the host)
     shm_size: 256m  # per-camera snapshot JPEGs live in /dev/shm
     networks:
       aiport:

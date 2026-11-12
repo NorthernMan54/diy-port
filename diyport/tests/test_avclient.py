@@ -49,6 +49,8 @@ class Base(unittest.TestCase):
         av._last_object_coord_by_device.clear()
         av._stream_dims.clear()
         av._active_streams.clear()
+        av._stream_source.clear()
+        av._reset_pending.clear()
         av._pending_leaves.clear()
         av._latest_frame.clear()
         av._latest_frame_time.clear()
@@ -2094,19 +2096,27 @@ class TestSnapshotUpload(Base):
             self.posted.append(files["payload"][1]) or self._Resp())
         self.addCleanup(lambda: setattr(av.requests, "post", self._orig_post))
 
-    INFO = {"mac_nosep": "X", "type": "UVC AI Port", "sysid_hex": "0xa5f1"}
+    INFO = {"mac_nosep": "X", "type": "UVC AI Port", "sysid_hex": "0xa5f1",
+            "console_host": "10.10.10.5"}
+    URI = "https://10.10.10.5:6666/internal/camera-upload/01234567-89ab-cdef-0123-456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        self._orig_slots = av._live_snapshot_slots
+        av._live_snapshot_slots = threading.BoundedSemaphore(2)
+        self.addCleanup(lambda: setattr(av, "_live_snapshot_slots", self._orig_slots))
 
     def test_fullfov_uploads_full_frame(self):
         self._with_stream("AAA")
         av._record_snapshot_filename("full.jpg", "AAA", kind="fullfov")
-        av._upload_snapshot("https://c/upload/t", self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
+        av._upload_snapshot(self.URI, self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
         self.assertEqual(len(self.posted), 1)
         self.assertTrue(self.posted[0].endswith(b"AAA"))
 
     def test_kept_best_frame_wins_over_current(self):
         self._with_stream("AAA")
         av._record_snapshot_filename("full.jpg", "AAA", kind="fullfov", jpeg=b"\xff\xd8BEST\xff\xd9")
-        av._upload_snapshot("https://c/upload/t", self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
+        av._upload_snapshot(self.URI, self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
         self.assertEqual(self.posted, [b"\xff\xd8BEST\xff\xd9"])
 
     @unittest.skipUnless(_FFMPEG, "ffmpeg not installed")
@@ -2118,7 +2128,7 @@ class TestSnapshotUpload(Base):
             best = f.read()
         av._record_snapshot_filename("obj.jpg", "AAA", kind="object", coord=[400, 300, 100, 100],
                                      jpeg=best)
-        av._upload_snapshot("https://c/upload/t", self.INFO, "obj.jpg", "smartDetectZoneSnapshot")
+        av._upload_snapshot(self.URI, self.INFO, "obj.jpg", "smartDetectZoneSnapshot")
         self.assertEqual(len(self.posted), 1)
         self.assertTrue(self.posted[0].startswith(b"\xff\xd8"))
         self.assertNotEqual(self.posted[0], best)  # cropped, not the whole frame
@@ -2128,13 +2138,13 @@ class TestSnapshotUpload(Base):
         self._with_stream("AAA", "BBB")
         av._active_streams["AAA"] = object()
         av._active_streams["BBB"] = object()
-        av._upload_snapshot("https://c/upload/t", self.INFO, None, "smartDetectZoneSnapshot")
+        av._upload_snapshot(self.URI, self.INFO, None, "smartDetectZoneSnapshot")
         self.assertEqual(self.posted, [])
 
     def test_unknown_sole_stream_falls_back(self):
         self._with_stream("AAA")
         av._active_streams["AAA"] = object()
-        av._upload_snapshot("https://c/upload/t", self.INFO, None, "smartDetectZoneSnapshot")
+        av._upload_snapshot(self.URI, self.INFO, None, "smartDetectZoneSnapshot")
         self.assertEqual(len(self.posted), 1)
         self.assertTrue(self.posted[0].endswith(b"AAA"))
 
@@ -2142,6 +2152,65 @@ class TestSnapshotUpload(Base):
         self._with_stream("AAA")
         av._upload_snapshot(None, self.INFO, "x", "snapshot")
         self.assertEqual(self.posted, [])
+
+    def test_rejects_unexpected_snapshot_targets(self):
+        self._with_stream("AAA")
+        av._record_snapshot_filename("full.jpg", "AAA", kind="fullfov")
+        slug = "01234567-89ab-cdef-0123-456789abcdef"
+        bad = [
+            f"http://10.10.10.5:6666/internal/camera-upload/{slug}",
+            f"https://10.10.10.6:6666/internal/camera-upload/{slug}",
+            f"https://10.10.10.5:443/internal/camera-upload/{slug}",
+            f"https://10.10.10.5:6666/internal/update/{slug}",
+            f"https://user:pass@10.10.10.5:6666/internal/camera-upload/{slug}",
+            f"https://10.10.10.5:6666/internal/camera-upload/{slug}?x=1",
+            "https://10.10.10.5:6666/internal/camera-upload/short",
+        ]
+        for uri in bad:
+            with self.subTest(uri=uri):
+                av._upload_snapshot(uri, self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
+        self.assertEqual(self.posted, [])
+
+    def test_live_snapshot_refuses_stale_frame(self):
+        self._with_stream("AAA")
+        av._active_streams["AAA"] = object()
+        av._latest_frame_time["AAA"] = (1, int((time.monotonic() - 10) * 1000))
+        uri = "https://10.10.10.5:7444/internal/camera-upload/abcdefgh12345678"
+        av._upload_snapshot(uri, self.INFO, None, "snapshot", "AAA")
+        self.assertEqual(self.posted, [])
+
+    def test_live_snapshot_accepts_fresh_frame(self):
+        self._with_stream("AAA")
+        av._active_streams["AAA"] = object()
+        av._latest_frame_time["AAA"] = (1, int(time.monotonic() * 1000))
+        uri = "https://10.10.10.5:7444/internal/camera-upload/abcdefgh12345678"
+        av._upload_snapshot(uri, self.INFO, None, "snapshot", "AAA")
+        self.assertEqual(len(self.posted), 1)
+
+    def test_live_snapshot_refuses_when_two_uploads_are_busy(self):
+        self._with_stream("AAA")
+        av._active_streams["AAA"] = object()
+        av._latest_frame_time["AAA"] = (1, int(time.monotonic() * 1000))
+        av._live_snapshot_slots.acquire()
+        av._live_snapshot_slots.acquire()
+        uri = "https://10.10.10.5:7444/internal/camera-upload/abcdefgh12345678"
+        av._upload_snapshot(uri, self.INFO, None, "snapshot", "AAA")
+        self.assertEqual(self.posted, [])
+
+    @unittest.skipUnless(_FFMPEG, "ffmpeg not installed")
+    def test_limit_snapshot_width_downscales(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "big.jpg")
+            make_frame(src, 1920, 1080)
+            with open(src, "rb") as f:
+                data = f.read()
+            out = av._limit_snapshot_width(data, 1280, "max")
+            dst = os.path.join(d, "small.jpg")
+            with open(dst, "wb") as f:
+                f.write(out)
+            size = av._jpeg_size(dst)
+            self.assertIsNotNone(size)
+            self.assertLessEqual(size[0], 1280)
 
 
 class TestCrop(unittest.TestCase):
@@ -2688,13 +2757,53 @@ class TestStreamPoints(Base):
         self.stream("A")
         self.stream("B", w=3840, h=2160)
         self.stopped.clear()
-        sent = self.call("ResetAIPortStreams", {})
+        with mock.patch.object(av, "RESET_GRACE_S", 0):
+            sent = self.call("ResetAIPortStreams", {})
         self.assertEqual(sent, [("ResetAIPortStreams", {})])
         self.assertEqual(av._stream_points, {})
         self.assertEqual(sorted(self.stopped),
                          [("detector", "A", True), ("detector", "B", True),
                           ("stream", "A"), ("stream", "B")])
         self.assertEqual(self.call("GetStreamList", {})[0][1], {"list": []})
+
+    def test_reset_grace_stops_after_timeout(self):
+        self.stream("A")
+        self.stopped.clear()
+        with mock.patch.object(av, "RESET_GRACE_S", 0.15):
+            self.call("ResetAIPortStreams", {})
+            self.assertEqual(self.stopped, [])
+            time.sleep(0.3)
+        self.assertIn(("stream", "A"), self.stopped)
+        self.assertIn(("detector", "A", True), self.stopped)
+        self.assertEqual(av._stream_points, {})
+
+    def test_reset_grace_keeps_reissued_stream(self):
+        self.stream("A")
+        self.stream("B")
+        self.stopped.clear()
+        with mock.patch.object(av, "RESET_GRACE_S", 0.15):
+            self.call("ResetAIPortStreams", {})
+            self.stream("A")  # re-issued before the grace expires
+            time.sleep(0.3)
+        streams = [call for call in self.stopped if call[0] == "stream"]
+        self.assertEqual(streams, [("stream", "B")])
+        self.assertIn("A", av._stream_points)
+
+
+class TestStreamReuse(Base):
+    class _Proc:
+        def poll(self):
+            return None
+
+    def test_same_source_keeps_existing_pull(self):
+        av._active_streams["D"] = self._Proc()
+        av._stream_source["D"] = ("10.0.0.1", "7447", "abc",
+                                  "rtsp://10.0.0.1:7447/abc", 1920, 1080)
+        with mock.patch.object(av, "_stop_stream") as stop, \
+                mock.patch.object(av, "_probe_stream") as probe:
+            av._start_stream("D", "10.0.0.1", "7447", "abc", 1920, 1080)
+        stop.assert_not_called()
+        probe.assert_not_called()
 
 
 class TestFirmwareUpdate(unittest.TestCase):
@@ -3541,44 +3650,49 @@ class TestProbeParse(unittest.TestCase):
                          {"codec": None, "width": None, "height": None, "fps": None})
 
 
-class TestSharedDecodeKeep(unittest.TestCase):
-    """Live 2026-11-07 on 92DE633106E8 (15 fps): a whole stride, round(15/10) = 2, gave
-    7.5 fps and "falling behind" every minute; keep 10 of every 15, evenly spread."""
+class TestStatusEvent(unittest.TestCase):
+    def setUp(self):
+        av._last_status_sent.clear()
+        self.addCleanup(av._last_status_sent.clear)
 
-    def kept(self, fps, n=60):
-        keep = av._shared_decode_keep(fps)
-        return [i for i in range(n) if av._shared_decode_keeps(i, keep)]
+    def test_audio_event_readiness_is_false(self):
+        ws = _FakeWS()
+        av._send_status_event(ws, "D", True, True, True, av.AUDIO_EVENT_READY)
+        payload = json.loads(ws.sent[0])["payload"]
+        self.assertTrue(payload["isSmartDetectReady"])
+        self.assertFalse(payload["isAudioEventReady"])
 
-    def test_15fps_keeps_the_detection_rate(self):
-        self.assertEqual(av._shared_decode_keep(15), (av.DETECT_FPS, 15))
-        kept = self.kept(15, 30)
-        self.assertEqual(len(kept), 2 * av.DETECT_FPS)
-        gaps = {b - a for a, b in zip(kept, kept[1:])}
-        self.assertLessEqual(gaps, {1, 2})               # evenly spread, no bursts
 
-    def test_whole_multiples_are_a_plain_stride(self):
-        self.assertEqual(len(self.kept(20)), 30)
-        self.assertEqual({b - a for a, b in zip(self.kept(20), self.kept(20)[1:])}, {2})
-        self.assertEqual(len(self.kept(30)), 20)
+class TestStopAllStreams(Base):
+    def setUp(self):
+        super().setUp()
+        av._stream_points.clear()
+        self.addCleanup(av._stream_points.clear)
 
-    def test_slow_or_odd_sources_keep_every_frame(self):
-        self.assertEqual(self.kept(8, 16), list(range(16)))
-        self.assertEqual(av._shared_decode_keep(14.985), (av.DETECT_FPS, 15))
-        self.assertEqual(av._shared_decode_keep(0.2), (1, 1))
+    def test_detector_stops_before_stream_and_receives_ws(self):
+        calls = []
+        ws = object()
+        av._stream_points["D"] = 2
+        with mock.patch.object(
+                av, "_stop_motion_detector",
+                side_effect=lambda dev, preserve_tracks=False, ws=None:
+                    calls.append(("detector", dev, preserve_tracks, ws))), \
+                mock.patch.object(
+                    av, "_stop_stream", side_effect=lambda dev: calls.append(("stream", dev))):
+            av._stop_all_streams(ws=ws)
+        self.assertEqual(calls, [("detector", "D", False, ws), ("stream", "D")])
+        self.assertEqual(av._stream_points, {})
 
-    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
-    def test_ffmpeg_select_matches_the_wall_time_feeder(self):
-        # Each kept output frame takes the wall time of the input frame the feeder queued
-        # for it, so ffmpeg's select must pick exactly the same input frames.
-        keep = av._shared_decode_keep(15)
-        out = subprocess.run(
-            ["ffmpeg", "-v", "info", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=15:duration=3",
-             "-vf", av._shared_decode_select(keep) + ",showinfo",
-             "-f", "null", "-"], capture_output=True, text=True, check=True).stderr
-        pts = [int(line.split("pts:")[1].split()[0]) for line in out.splitlines()
-               if "pts:" in line and "showinfo" in line]
-        expect = [i for i in range(45) if av._shared_decode_keeps(i, keep)]
-        self.assertEqual(pts, expect)
+    def test_preserve_tracks_is_forwarded(self):
+        calls = []
+        av._stream_points["D"] = 2
+        with mock.patch.object(
+                av, "_stop_motion_detector",
+                side_effect=lambda dev, preserve_tracks=False, ws=None:
+                    calls.append(("detector", dev, preserve_tracks, ws))), \
+                mock.patch.object(av, "_stop_stream", side_effect=lambda dev: None):
+            av._stop_all_streams(preserve_tracks=True, ws=None)
+        self.assertEqual(calls, [("detector", "D", True, None)])
 
 
 if __name__ == "__main__":
