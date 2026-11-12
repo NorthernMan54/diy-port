@@ -1344,6 +1344,12 @@ class FlvPush:
             reason = repr(exc)
         finally:
             if self._sock:
+                try:
+                    # shutdown() first: on Linux close() alone leaves the push half-open while
+                    # drain_socket's thread is blocked in recv() on it (macOS wakes the recv).
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 self._sock.close()
                 self._sock = None
         if not self._stop.is_set():
