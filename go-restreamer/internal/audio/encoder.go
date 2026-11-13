@@ -54,6 +54,18 @@ func NewEncoder(ffmpegPath string, log *slog.Logger) *Encoder {
 	return &Encoder{cfg: Config{FFmpegPath: ffmpegPath, Log: log}, log: log, subs: map[uint64]encSub{}, tcs: map[int]*encTC{}}
 }
 
+// NewEncoderAAC is NewEncoder with the AAC output at rate Hz and bitrate bits per second.
+func NewEncoderAAC(ffmpegPath string, rate, bitrate int, log *slog.Logger) *Encoder {
+	e := NewEncoder(ffmpegPath, log)
+	e.cfg.AACRate, e.cfg.AACBitrate = rate, bitrate
+	return e
+}
+
+// OpusAvailable reports whether the ffmpeg at path (or on PATH) has libopus.
+func OpusAvailable(path string) bool {
+	return ffmpegAvailable(path) && opusEncoderAvailable(ffmpegPath(path))
+}
+
 // Starts is how many ffmpeg transcoders this Encoder has spawned.
 func (e *Encoder) Starts() uint64 {
 	e.mu.Lock()

@@ -163,3 +163,15 @@ func TestValidateRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestAIPortModeAndFieldsDecode(t *testing.T) {
+	var p ConfigureParams
+	js := `{"device_id":"A","mode":"aiport","channels":[{"channel":"video1","rtsp_url":"r","dest_host":"h","dest_port":7550,` +
+		`"fps":20,"retry_interval_s":2,"connect_timeout_s":5,"bitrate_kbps":6000}]}`
+	if err := json.Unmarshal([]byte(js), &p); err != nil || p.Validate() != nil {
+		t.Fatalf("aiport config rejected: %v %v", err, p.Validate())
+	}
+	if c := p.Channels[0]; c.FPS != 20 || c.RetryIntervalS != 2 || c.ConnectTimeoutS != 5 || c.BitrateKbps != 6000 {
+		t.Errorf("channel %+v", c)
+	}
+}

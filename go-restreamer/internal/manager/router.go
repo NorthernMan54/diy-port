@@ -47,7 +47,7 @@ func newRouter(name, url, mode string, caps transcode.Caps, log *slog.Logger) *r
 }
 
 func (r *router) wantTC(t media.Tracks) bool {
-	return r.mode == "transcode" || t.Video == media.H265
+	return r.mode == "transcode" || r.mode == modeAIPort || t.Video == media.H265
 }
 
 // set adds or updates a channel. A transcoder in use is rebuilt if the profiles it has to

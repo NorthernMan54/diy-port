@@ -30,7 +30,7 @@ const (
 // identical one is a no-op; a changed one restarts only the channels that differ.
 type ConfigureParams struct {
 	DeviceID     string        `json:"device_id"`
-	Mode         string        `json:"mode"` // "copy" (default) or "transcode"
+	Mode         string        `json:"mode"` // "copy" (default), "transcode", or "aiport" (AI Port exact: one pull, three encodes, ubnt_streamer's FLV)
 	SharedDecode *SharedDecode `json:"shared_decode,omitempty"`
 	Channels     []Channel     `json:"channels"`
 }
@@ -63,6 +63,12 @@ type Channel struct {
 	// Request counts Protect's ChangeVideoSettings for this channel (Python bumps it each
 	// time). A change un-parks a push Protect had rejected; nothing else restarts.
 	Request int64 `json:"request"`
+	// aiport mode only. FPS is the console's fps for the channel (0: the camera's, or the
+	// channel's fixed 24 for video2/3); RetryIntervalS / ConnectTimeoutS are the destination
+	// URI's retryInterval / connectTimeout in seconds (0: 1 s each, the streamer's defaults).
+	FPS             float64 `json:"fps,omitempty"`
+	RetryIntervalS  float64 `json:"retry_interval_s,omitempty"`
+	ConnectTimeoutS float64 `json:"connect_timeout_s,omitempty"`
 }
 
 // Validate rejects what no camera could run.
@@ -71,9 +77,9 @@ func (p *ConfigureParams) Validate() error {
 		return fmt.Errorf("device_id is required")
 	}
 	switch p.Mode {
-	case "", "copy", "transcode":
+	case "", "copy", "transcode", "aiport":
 	default:
-		return fmt.Errorf("mode %q: want copy or transcode", p.Mode)
+		return fmt.Errorf("mode %q: want copy, transcode or aiport", p.Mode)
 	}
 	seen := map[string]bool{}
 	for i, c := range p.Channels {

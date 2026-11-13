@@ -63,10 +63,29 @@ type Config struct {
 	// OpusRate is the sample rate the Opus output is encoded at (0: 48000); a shared Encoder
 	// keeps one ffmpeg per rate.
 	OpusRate int
+	// AACRate / AACBitrate shape the AAC an ffmpeg transcode makes (0: 32000 Hz, 32 kbps).
+	AACRate, AACBitrate int
 	// Encoder, when set, replaces the Normalizer's own ffmpeg with a shared one (encoder.go);
 	// its owner feeds it the camera frames, so OnAudio only passes copied audio through.
 	Encoder *Encoder
 	Log     *slog.Logger
+}
+
+// aacRate and aacBitrate are the AAC output's rate (default AACRate, 32 kHz) and bits per second
+// (default 32k). The AI Port exact push sets 48 kHz and 128k, avenc_aac's defaults on its 48 kHz
+// pipeline (docs/aiport-onvif-push-spec.md 7).
+func (c Config) aacRate() int {
+	if c.AACRate > 0 {
+		return c.AACRate
+	}
+	return AACRate
+}
+
+func (c Config) aacBitrate() int {
+	if c.AACBitrate > 0 {
+		return c.AACBitrate
+	}
+	return 32000
 }
 
 func (c Config) opusRate() int {

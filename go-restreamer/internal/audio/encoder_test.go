@@ -259,3 +259,25 @@ func TestSharedEncoderOneFFmpegPerOpusRate(t *testing.T) {
 		t.Fatal("encoder stopped with subscribers left")
 	}
 }
+
+// The AI Port exact push asks the shared encoder for AAC at 48 kHz and 128 kbps (spec 7); the
+// default stays 32 kHz / 32 kbps.
+func TestAACRateAndBitrateArgs(t *testing.T) {
+	has := func(a []string, k, v string) bool {
+		for i := 0; i+1 < len(a); i++ {
+			if a[i] == k && a[i+1] == v {
+				return true
+			}
+		}
+		return false
+	}
+	enc := NewEncoderAAC("ffmpeg", 48000, 128000, nil)
+	a := (&transcoder{cfg: enc.cfg, codec: media.PCMA, out: func(media.AudioFrame) {}}).args()
+	if !has(a, "-ar", "48000") || !has(a, "-b:a", "128k") {
+		t.Errorf("exact args %v", a)
+	}
+	a = (&transcoder{cfg: Config{}, codec: media.PCMA, out: func(media.AudioFrame) {}}).args()
+	if !has(a, "-ar", "32000") || !has(a, "-b:a", "32k") {
+		t.Errorf("default args %v", a)
+	}
+}

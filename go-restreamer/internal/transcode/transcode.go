@@ -28,6 +28,12 @@ type Profile struct {
 	Height      int
 	BitrateKbps int
 	GOP         int
+	// FitWidth, MaxShortSide and FPS shape the AI Port exact profiles (see target and resamples):
+	// FitWidth scales to that width (portrait: height), MaxShortSide caps the short side, FPS > 0
+	// resamples to that rate with ffmpeg's fps filter (0: the source's, one AU out per AU in).
+	FitWidth     int
+	MaxShortSide int
+	FPS          float64
 }
 
 // Config for one camera's Transcoder.
@@ -334,6 +340,13 @@ type run struct {
 	ptsQ    [][]time.Duration // per profile: source PTS of AUs written, popped as that profile's AUs come out (no B-frames, no drops: 1:1)
 	lastPTS []time.Duration
 	fps     float64
+	// Resampled profiles (Profile.FPS differing from the source) emit AUs on their own frame
+	// grid, so their PTS is not paired by count: the first AU takes the first input's PTS, then
+	// each steps by 1/FPS, pulled back to latestIn (the newest input written) if it drifts more
+	// than a second either way (a stall in the input, ffmpeg's own dup/drop catching up).
+	grid     []time.Duration
+	gridOK   []bool
+	latestIn time.Duration
 }
 
 func (t *Transcoder) startRun(src media.Tracks) *run {
@@ -345,6 +358,8 @@ func (t *Transcoder) startRun(src media.Tracks) *run {
 	}
 	r.ptsQ = make([][]time.Duration, len(t.cfg.Profiles))
 	r.lastPTS = make([]time.Duration, len(t.cfg.Profiles))
+	r.grid = make([]time.Duration, len(t.cfg.Profiles))
+	r.gridOK = make([]bool, len(t.cfg.Profiles))
 	r.needIDR.Store(true)
 	go r.supervise(ctx)
 	return r
@@ -439,6 +454,7 @@ func (r *run) once(ctx context.Context) error {
 	r.ptsMu.Lock()
 	for i := range r.ptsQ {
 		r.ptsQ[i] = nil // a new ffmpeg's first output is its first input
+		r.gridOK[i] = false
 	}
 	r.ptsMu.Unlock()
 	args := buildArgs(t.caps, src, r.fps, t.cfg.Profiles)
@@ -526,6 +542,7 @@ func (r *run) once(ctx context.Context) error {
 			}
 			buf = annexB(buf, au.NALUs...)
 			r.ptsMu.Lock()
+			r.latestIn = au.PTS
 			for i := range r.ptsQ {
 				r.ptsQ[i] = append(r.ptsQ[i], au.PTS)
 				if len(r.ptsQ[i]) > 512 {
@@ -582,7 +599,11 @@ func (r *run) readOutput(idx int, o *output, rd *os.File, lastOut *atomic.Int64)
 		au.PTS = r.nextPTS(idx)
 		if au.IDR && sps != nil && pps != nil {
 			s := r.source()
-			tr := media.Tracks{Video: media.H264, SPS: sps, PPS: pps, FPS: r.fps,
+			fps := r.fps
+			if o.profile.resamples(r.fps) {
+				fps = o.profile.FPS
+			}
+			tr := media.Tracks{Video: media.H264, SPS: sps, PPS: pps, FPS: fps,
 				Audio: s.Audio, AudioRate: s.AudioRate, AudioChannels: s.AudioChannels, AudioConfig: s.AudioConfig}
 			var parsed h264.SPS
 			if parsed.Unmarshal(sps) == nil {
@@ -611,6 +632,24 @@ func (r *run) readOutput(idx int, o *output, rd *os.File, lastOut *atomic.Int64)
 func (r *run) nextPTS(idx int) time.Duration {
 	r.ptsMu.Lock()
 	defer r.ptsMu.Unlock()
+	if p := r.t.cfg.Profiles[idx]; p.resamples(r.fps) {
+		step := time.Duration(float64(time.Second) / p.FPS)
+		switch {
+		case !r.gridOK[idx]:
+			r.grid[idx] = r.latestIn
+			if len(r.ptsQ[idx]) > 0 {
+				r.grid[idx] = r.ptsQ[idx][0]
+			}
+			r.gridOK[idx] = true
+		default:
+			r.grid[idx] += step
+			if d := r.latestIn - r.grid[idx]; d > time.Second || d < -time.Second {
+				r.grid[idx] = r.latestIn
+			}
+		}
+		r.ptsQ[idx] = r.ptsQ[idx][:0]
+		return r.grid[idx]
+	}
 	if len(r.ptsQ[idx]) == 0 {
 		r.lastPTS[idx] += time.Duration(float64(time.Second) / r.fps)
 		return r.lastPTS[idx]

@@ -7,8 +7,10 @@
 package manager
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"diyport/go-restreamer/internal/audio"
 	"diyport/go-restreamer/internal/detect"
 	"diyport/go-restreamer/internal/flv"
+	"diyport/go-restreamer/internal/media"
 	"diyport/go-restreamer/internal/rpc"
 	"diyport/go-restreamer/internal/rtsp"
 	"diyport/go-restreamer/internal/transcode"
@@ -43,7 +46,24 @@ type Options struct {
 	Caps         *transcode.Caps   // tests inject; nil probes ffmpeg
 	Dialer       rtsp.Dialer       // nil: gortsplib over TCP
 	Tune         func(*flv.Config) // tests: shorten retry timers
+	TuneAIPort   func(*flv.AIPortConfig)
 	Log          *slog.Logger
+}
+
+// modeAIPort is configure_camera's mode for the AI Port exact push: the camera's main stream is
+// pulled once, decoded once and encoded three times (video1 at source size, video2 at width 1280
+// and 24 fps, video3 at width 640), and each channel is pushed by flv.AIPortPusher, byte for
+// byte as ubnt_streamer does (docs/aiport-onvif-push-spec.md). Python selects it with
+// AIPORT_ONVIF_MODE=go-aiport.
+const modeAIPort = "aiport"
+
+// pusher is what the manager needs of a channel's push: flv.Pusher or flv.AIPortPusher.
+type pusher interface {
+	media.Subscriber
+	Close()
+	Stats() flv.Stats
+	Unpark()
+	SetAudioEncoder(*audio.Encoder)
 }
 
 // Manager is the rpc.Handler.
@@ -105,14 +125,14 @@ type group struct {
 type chanState struct {
 	cfg     rpc.Channel
 	fan     *fan
-	pusher  *flv.Pusher
+	pusher  pusher
 	started time.Time
 }
 
 // pushKey is what a pusher is built from; anything else about a channel is routing.
-func pushKey(c rpc.Channel) [4]string {
-	return [4]string{c.StreamName, net.JoinHostPort(c.DestHost, strconv.Itoa(c.DestPort)),
-		strconv.FormatBool(c.AudioEnabled), opusKey(c)}
+func pushKey(c rpc.Channel) [6]string {
+	return [6]string{c.StreamName, net.JoinHostPort(c.DestHost, strconv.Itoa(c.DestPort)),
+		strconv.FormatBool(c.AudioEnabled), opusKey(c), fmt.Sprint(c.RetryIntervalS), fmt.Sprint(c.ConnectTimeoutS)}
 }
 
 // opusRate is the rate a channel's Opus is encoded at, 0 when it has none (the Options.Opus
@@ -146,7 +166,85 @@ func profile(c rpc.Channel) transcode.Profile {
 	return transcode.Profile{Name: c.Channel, Width: c.Width, Height: c.Height, BitrateKbps: c.BitrateKbps}
 }
 
-func (m *Manager) newPusher(cam *camera, c rpc.Channel) *flv.Pusher {
+// profileFor is the profile a channel is encoded with on a camera in cam's mode. aiport mode
+// mirrors ubnt_av_aiport's three encoders (spec 2 and 3):
+//
+//	video1  source size (short side capped at 2160), the console's fps (else the camera's), GOP one
+//	        second of frames, bitrate from the console (ChangeVideoParams; 8 Mbps template default);
+//	video2  width 1280 (aspect kept, even), 24 fps, GOP 24, 2 Mbps;
+//	video3  width 640, lq fps 24 (the real OD lowers it to 8 once a second stream exists: not
+//	        modelled), GOP 24, 300 kbps. AQ and LQ bitrates ignore the console, as on the box.
+func profileFor(cam *camera, c rpc.Channel) transcode.Profile {
+	if cam.mode != modeAIPort {
+		return profile(c)
+	}
+	p := transcode.Profile{Name: c.Channel}
+	switch c.Channel {
+	case "video2":
+		p.FitWidth, p.FPS, p.BitrateKbps, p.GOP = 1280, 24, 2000, 24
+		// AIPORT_ONVIF_AQ_FPS=source: keep the camera's fps (GOP = 1 s of it) instead of the box's
+		// fixed 24. Experiment: native medium streams run at the console-requested fps (20 live).
+		if os.Getenv("AIPORT_ONVIF_AQ_FPS") == "source" {
+			p.FPS, p.GOP = 0, 0
+		}
+	case "video3":
+		p.FitWidth, p.FPS, p.BitrateKbps, p.GOP = 640, 24, 300, 24
+		// AIPORT_ONVIF_LQ_FPS=source: as AQ_FPS for video3. Live 2026-11-12 22:40: Side Door LQ spins
+		// in Safari at 24 fps resampled from 20 (uneven 41/42 ms steps, r_frame_rate 120/1).
+		if os.Getenv("AIPORT_ONVIF_LQ_FPS") == "source" {
+			p.FPS, p.GOP = 0, 0
+		}
+	default:
+		p.MaxShortSide, p.BitrateKbps = 2160, 8000
+		if c.BitrateKbps > 0 {
+			p.BitrateKbps = c.BitrateKbps
+		}
+		if c.FPS > 0 {
+			p.FPS, p.GOP = c.FPS, int(c.FPS+0.5)
+		}
+	}
+	return p
+}
+
+func secs(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+
+func (m *Manager) newAIPortPusher(cam *camera, c rpc.Channel) *flv.AIPortPusher {
+	rate := m.opusRate(cam, c)
+	p := profileFor(cam, c)
+	cfg := flv.AIPortConfig{
+		Addr:       net.JoinHostPort(c.DestHost, strconv.Itoa(c.DestPort)),
+		StreamName: c.StreamName,
+		Channel:    c.Channel,
+		Width:      c.Width,
+		Height:     c.Height,
+		FPS:        p.FPS,
+		BitrateBps: p.BitrateKbps * 1000,
+		// AIPORT_ONVIF_NO_AUDIO=1: video-only pushes (header 0x03, hasAudio false). Live 2026-11-12
+		// 22:45: Flynn's Driveway LQ (no audio track) plays in Safari, Side Door's (AAC 48 kHz) spins.
+		AudioEnabled:  c.AudioEnabled && os.Getenv("AIPORT_ONVIF_NO_AUDIO") != "1",
+		Opus:          rate > 0 && os.Getenv("AIPORT_ONVIF_NO_AUDIO") != "1",
+		AACRate:       func() int { r, _ := aacRateEnv(); return r }(),
+		AudioCounter:  os.Getenv("AIPORT_ONVIF_AUDIO_COUNTER") == "1",
+		OpusRate:      rate,
+		FFmpegPath:    m.caps.FFmpeg,
+		AudioEncoder:  m.encoder(cam, c.RTSPURL),
+		RetryInterval: secs(c.RetryIntervalS),
+		DialTimeout:   secs(c.ConnectTimeoutS),
+		Log:           m.log.With("device", cam.id, "channel", c.Channel),
+	}
+	if c.Channel == "video1" {
+		cfg.OnStart, cfg.OnSync, cfg.OnWrote = cam.clock.Reset, cam.clock.Synced, cam.clock.Wrote
+	}
+	if m.opts.TuneAIPort != nil {
+		m.opts.TuneAIPort(&cfg)
+	}
+	return flv.NewAIPortPusher(cfg)
+}
+
+func (m *Manager) newPusher(cam *camera, c rpc.Channel) pusher {
+	if cam.mode == modeAIPort {
+		return m.newAIPortPusher(cam, c)
+	}
 	rate := m.opusRate(cam, c)
 	cfg := flv.Config{
 		Addr:          net.JoinHostPort(c.DestHost, strconv.Itoa(c.DestPort)),
@@ -172,12 +270,18 @@ func (m *Manager) newPusher(cam *camera, c rpc.Channel) *flv.Pusher {
 
 // encoder returns the camera's shared audio encoder for a URL, making it on first use.
 func (m *Manager) encoder(cam *camera, url string) *audio.Encoder {
-	if m.opts.NoAudioShare {
+	if m.opts.NoAudioShare && cam.mode != modeAIPort {
 		return nil // each Normalizer runs its own ffmpeg
 	}
 	e := cam.encs[url]
 	if e == nil {
-		e = audio.NewEncoder(m.caps.FFmpeg, m.log.With("device", cam.id))
+		if cam.mode == modeAIPort {
+			// AAC at 48 kHz, avenc_aac's default 128 kbps (spec 7), for camera audio of any codec.
+			rate, br := aacRateEnv()
+			e = audio.NewEncoderAAC(m.caps.FFmpeg, rate, br, m.log.With("device", cam.id))
+		} else {
+			e = audio.NewEncoder(m.caps.FFmpeg, m.log.With("device", cam.id))
+		}
 		cam.encs[url] = e
 	}
 	return e
@@ -192,6 +296,12 @@ func (m *Manager) Configure(p rpc.ConfigureParams) (any, error) {
 		mode = "copy"
 	}
 	cam := m.cams[p.DeviceID]
+	if cam != nil && (cam.mode == modeAIPort) != (mode == modeAIPort) {
+		// A different kind of push and different encodes: start the camera over.
+		m.removeCamera(cam)
+		delete(m.cams, p.DeviceID)
+		cam = nil
+	}
 	if cam == nil {
 		cam = &camera{id: p.DeviceID, mode: mode, groups: map[string]*group{}, encs: map[string]*audio.Encoder{}, chans: map[string]*chanState{},
 			clock: detect.NewClock()}
@@ -252,6 +362,9 @@ func (m *Manager) applyChannel(cam *camera, c rpc.Channel) bool {
 	if old.Request != c.Request {
 		cs.pusher.Unpark() // Protect asked for this channel again: try a parked push anew
 	}
+	if ap, ok := cs.pusher.(*flv.AIPortPusher); ok && old.BitrateKbps != c.BitrateKbps {
+		ap.SetBitrate(profileFor(cam, c).BitrateKbps * 1000) // the next onMpma carries it
+	}
 	if pushKey(old) != pushKey(c) {
 		np := m.newPusher(cam, c)
 		cs.fan.add(np) // gets the live tracks at once, then waits for its IDR
@@ -261,7 +374,7 @@ func (m *Manager) applyChannel(cam *camera, c rpc.Channel) bool {
 		cs.started = time.Now()
 		m.log.Info("channel push restarted", "device", cam.id, "channel", c.Channel)
 	}
-	if old.RTSPURL != c.RTSPURL || profile(old) != profile(c) {
+	if old.RTSPURL != c.RTSPURL || profileFor(cam, old) != profileFor(cam, c) {
 		m.route(cam, cs, c, old.RTSPURL)
 	}
 	cs.cfg = c
@@ -280,12 +393,12 @@ func (m *Manager) route(cam *camera, cs *chanState, c rpc.Channel, oldURL string
 		g.r.enc = m.encoder(cam, c.RTSPURL)
 		cam.groups[c.RTSPURL] = g
 		cs.pusher.SetAudioEncoder(g.r.enc)
-		g.r.set(c.Channel, member{fan: cs.fan, profile: profile(c)})
+		g.r.set(c.Channel, member{fan: cs.fan, profile: profileFor(cam, c)})
 		m.pool.Acquire(c.RTSPURL, g.r)
 		return
 	}
 	cs.pusher.SetAudioEncoder(g.r.enc) // no-op unless the channel moved URL
-	g.r.set(c.Channel, member{fan: cs.fan, profile: profile(c)})
+	g.r.set(c.Channel, member{fan: cs.fan, profile: profileFor(cam, c)})
 }
 
 func (m *Manager) leave(cam *camera, channel, url string) {
@@ -440,4 +553,19 @@ func (m *Manager) Stats() any {
 			Reconnects: s.Reconnects, Connected: s.Connected, LastFrameAgeMs: ageMs(s.LastFrame)})
 	}
 	return st
+}
+
+// aacRateEnv: AIPORT_ONVIF_AAC_RATE (default 48000, the box's avenc_aac at 128 kbps). At 16 kHz
+// or below the bitrate is 32 kbps. Live 2026-11-12: Protect's own ONVIF pull of Side Door served
+// 8 kHz AAC (one 128 ms frame per fragment, ~28 kbps) and Safari played it; ours (48 kHz, 21 ms
+// frames, ~100 kbps) spun in Safari.
+func aacRateEnv() (rate, bitrate int) {
+	rate, bitrate = 48000, 128000
+	if v, err := strconv.Atoi(os.Getenv("AIPORT_ONVIF_AAC_RATE")); err == nil && v > 0 {
+		rate = v
+		if v <= 16000 {
+			bitrate = 32000
+		}
+	}
+	return rate, bitrate
 }

@@ -9,6 +9,7 @@ package flv
 import (
 	"encoding/binary"
 	"math"
+	"sort"
 )
 
 // Prop is one AMF0 object entry; objects keep their order, as the Python's dicts do.
@@ -24,6 +25,11 @@ type (
 	ECMAArray []Prop
 )
 
+// Map is an AMF0 object written with its keys sorted byte-wise, the order ubnt_streamer's
+// std::map<string, variant> serializer produces (decompiled FUN_00200f80, docs/aiport-onvif-push-spec.md
+// 4.1). Values may be Map, bool, string or any numeric type (all numbers go out as doubles).
+type Map map[string]any
+
 func appendString(b []byte, s string) []byte {
 	b = binary.BigEndian.AppendUint16(b, uint16(len(s)))
 	return append(b, s...)
@@ -37,6 +43,23 @@ func AppendAMF(b []byte, v any) []byte {
 		return binary.BigEndian.AppendUint64(b, math.Float64bits(x))
 	case int:
 		return AppendAMF(b, float64(x))
+	case int32:
+		return AppendAMF(b, float64(x))
+	case uint32:
+		return AppendAMF(b, float64(x))
+	case float32:
+		return AppendAMF(b, float64(x))
+	case Map:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // Go compares strings byte-wise, as std::string's operator< does
+		b = append(b, 0x03)
+		for _, k := range keys {
+			b = AppendAMF(appendString(b, k), x[k])
+		}
+		return append(b, 0x00, 0x00, 0x09)
 	case int64:
 		return AppendAMF(b, float64(x))
 	case uint64:

@@ -194,6 +194,62 @@ class TestGoMode(unittest.TestCase):
             self.assertTrue(onvif_push.any_go())
 
 
+class TestGoAIPortMode(unittest.TestCase):
+    """AIPORT_ONVIF_MODE=go-aiport: the sidecar's AI Port exact path (docs/aiport-onvif-push-spec.md)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "r.sock")
+        p = mock.patch.object(onvif_push, "MODES", onvif_push.parse_modes("go-aiport"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_mode_is_a_go_mode_without_python_transcoding(self):
+        self.assertEqual(onvif_push.parse_modes("copy,AA:BB=go-aiport"), ("copy", {"AABB": "go-aiport"}))
+        with mock.patch.object(onvif_push, "transcode_available", return_value=False):
+            self.assertEqual(onvif_push.mode_of("CAM"), "go-aiport")
+        self.assertTrue(onvif_push.is_go("CAM"))
+        self.assertTrue(onvif_push.is_go_aiport("CAM"))
+        self.assertFalse(onvif_push.transcodes("CAM"))
+        self.assertTrue(onvif_push.any_go())
+
+    def test_all_channels_pull_the_main_stream_and_carry_the_console_settings(self):
+        fake = FakeSidecar(self.path)
+        client = onvif_push.RestreamerClient(self.path, retry_s=(0.05,))
+        self.addCleanup(client.close)
+        m = onvif_push.PushManager(fetch_profiles=lambda url: [], background=False, restreamer=client)
+        m.set_source("CAM", URL, audio=True)
+        serializer = lambda name: {"type": "extendedFlv", "destinations": [DEST],
+                                   "parameters": {"streamName": name, "withOpus": True, "opusSampleRate": 48000}}
+        # Encoder-only settings (no avSerializer) arrive apart from the serializer.
+        m.configure("CAM", {"video1": {"fps": 20, "bitRateVbrMax": 6000000}})
+        m.configure("CAM", {"video1": {"avSerializer": serializer("S1")},
+                            "video2": {"avSerializer": serializer("S2")}})
+
+        def channels():
+            sent = [r["params"] for r in fake.requests if r["method"] == "configure_camera"]
+            return sent[-1] if sent and len(sent[-1]["channels"]) == 2 else None
+        self.assertTrue(wait(channels))
+        params = channels()
+        self.assertEqual(params["mode"], "aiport")
+        v1, v2 = params["channels"]
+        self.assertEqual((v1["channel"], v1["fps"], v1["bitrate_kbps"]), ("video1", 20.0, 6000))
+        self.assertEqual((v1["retry_interval_s"], v1["connect_timeout_s"]), (1.0, 5.0))
+        self.assertEqual((v1["opus"], v1["opus_sample_rate"]), (True, 48000))
+        # video2 pulls the main stream too (go mode would use the substream when there is one).
+        self.assertEqual(v2["rtsp_url"], URL)
+        # A bitrate change after the push started is re-sent without a new push.
+        n = len(fake.requests)
+        m.configure("CAM", {"video1": {"bitRateVbrMax": 4000000}})
+        self.assertTrue(wait(lambda: len(fake.requests) > n))
+        self.assertEqual(channels()["channels"][0]["bitrate_kbps"], 4000)
+
+    def test_plain_go_payload_is_unchanged(self):
+        push = onvif_push.GoPush("CAM", "video1", URL, "S1", DEST, True, {}, None)
+        self.assertNotIn("fps", push.channel_params())
+        self.assertNotIn("retry_interval_s", push.channel_params())
+
+
 class TestSupervisor(unittest.TestCase):
     def test_missing_binary_logs_one_error_and_does_not_start(self):
         sup = run_all.RestreamerSupervisor("/nonexistent/bin", "/tmp/x.sock")

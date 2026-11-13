@@ -60,3 +60,40 @@ protocol** for video1 (path given in `shared_decode.socket` in `configure_camera
   pool dedup (fake dialer), RPC. Hardware tests behind `//go:build darwin && arm64` and skip
   when ffmpeg lacks videotoolbox.
 - Dense explanatory comments in the repo's style; no speculative abstractions.
+
+## AI Port exact mode (`mode: "aiport"`, Python `AIPORT_ONVIF_MODE=go-aiport`)
+A second, switchable push path that rebuilds the real AI Port's ONVIF video chain from the
+decompile in `docs/aiport-onvif-push-spec.md` (firmware v5.1.12). `go` stays the proven
+ffmpeg-era behaviour above; enable this per camera with `AIPORT_ONVIF_MODE=go-aiport` (same
+`<default>[,<deviceID>=<mode>]` syntax, e.g. `go,AABBCCDDEEFF=go-aiport`). Python sends
+`mode: "aiport"`; the sidecar rebuilds the camera if its mode crosses that boundary.
+
+- **Ingest and encode** (spec 2-3): one RTSP pull of the main stream (every channel uses the same
+  URL), decoded once, three encodes through `internal/transcode` (VideoToolbox on darwin, still
+  builds on Linux; no hardware encoder: H.264 is passed through at source size, H.265 fails):
+  video1 source size (short side capped at 2160) at the console's fps (else the camera's), GOP
+  one second, bitrate from the console (default 8 Mbps); video2 width 1280 (portrait: height),
+  aspect kept, even, 24 fps, GOP 24, 2 Mbps; video3 width 640, 24 fps, GOP 24, 300 kbps.
+  Resampled profiles stamp AUs on their own 1/fps grid (`Profile.FPS`, `FitWidth`,
+  `MaxShortSide`). Audio: one shared ffmpeg per camera decodes any codec to AAC 48 kHz mono
+  128 kbps (`audio.NewEncoderAAC`) and, when Protect asks `withOpus`, Opus at `opus_sample_rate`
+  mono 20 ms; no audio track at all when the camera has none (header flags 0x03).
+- **Push** (`flv.AIPortPusher`, spec 4-6): AMF0 objects with byte-wise sorted keys, header flags
+  0x07/0x03, onMetaData with exactly the spec's 13 keys (audio numbers are the streamer's
+  template 64000/1/16000), tag ts = dts_ms - baseDtsMillis (base from the first video frame, kept
+  across reconnects), 16-byte trailers `u32 timescale, u32 cts, u64 absolute pts ticks`
+  (video 90000, AAC 48000, Opus = opusSampleRate, script tags the timeline's last pts). Per key
+  frame: onMpma, onClockSync, config tag only if SPS/PPS changed, frame; non-key frames get a
+  throttled onMpma (500 ms if a value changed, else 10 s). No timer-driven onClockSync. Config
+  tags once per connection (AVC `17 00`, AAC `AF 00 11 88`, Opus `CF 00 03 <rateTag>`); a
+  reconnect sends header+onMetaData, video, AAC and Opus configs, then resumes at the next key
+  frame. One TCP per channel, flat `retry_interval_s`, `connect_timeout_s` (1..60), IP_TOS 184,
+  5 MiB output queue dropping whole frames (log at most every 30 s). The console's feedback
+  frames (`u16 type, u16 len, payload`) are read on the same socket: type 4 gets an `onRtt`
+  reply, 3 and 5 are logged, the rest ignored.
+- **onMpma values** are a guess (spec 4.5, open question 5): every cur/max/min slot and `t` hold
+  the channel's configured bitrate in bit/s; `r` is 0.
+- **Channel fields** used only here: `fps`, `retry_interval_s`, `connect_timeout_s`, and
+  `bitrate_kbps` (video1's console bitrate; a change is applied with `SetBitrate`, no restart).
+- Not implemented: an H.265 hvcC record (the path always re-encodes to H.264), runtime lq_fps
+  lowering to 8, feedback type 0-2 adaptation.

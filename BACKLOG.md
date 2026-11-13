@@ -58,6 +58,11 @@ is in [docs/motion-audio-findings.md](docs/motion-audio-findings.md). "Olli" is
 
 ## Investigate
 
+- **`Reboot` is ignored** (2026-11-12). Protect sent `Reboot` to the AI Port at 23:00:20 (live,
+  Saul ONVIF instance, 30 s after a camera was unpaired) and showed a restart as pending; diy-port
+  only logged it. A real AI Port reboots, so ack it and restart the instance (the `restart` file
+  path, as `diyport_service.sh` does), then reconnect.
+
 - **Protect's detection settings are ignored** (2026-11-12, spec review 2). Protect sends these
   in `ChangeSmartDetectSettings`, and diy-port reads none of them:
   - Per zone: `sensitivity` (50 seen).

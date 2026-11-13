@@ -58,6 +58,12 @@ SUB_CHANNELS = ("video2", "video3")
 #   copy (the default)  below's "copy"; pushes run in avclient. Works anywhere.
 #   transcode           below's "option C"; pushes run in avclient.
 #   isolated            option C, with pushes in a process per camera (onvif_restream.py).
+#   go-aiport           go, but the sidecar rebuilds the real AI Port's ONVIF video path
+#                       byte for byte (docs/aiport-onvif-push-spec.md, firmware v5.1.12): one pull
+#                       of the main stream, three hardware encodes (video1 source size, video2
+#                       width 1280 at 24 fps, video3 width 640) and ubnt_streamer's FLV (sorted
+#                       AMF keys, absolute-monotonic trailers, onMpma/onClockSync per key frame,
+#                       no silent audio filler). `go` keeps the proven ffmpeg-era push.
 #   go                  a Go sidecar (go-restreamer/, supervised by run_all.py) pulls and pushes;
 #                       this process only sends it configure_camera / remove_camera over a unix
 #                       socket (RestreamerClient). Needs no gst-launch. Shared decode reads the
@@ -84,8 +90,9 @@ SUB_CHANNELS = ("video2", "video3")
 # (unifi-cam-proxy's Driveway gets a UBNT one), and with a sync every 5 s a cold start played
 # ~1 s then paused ~5 s, as if waiting for the next sync to place frames on the wall clock.
 # A sync every 1 s was worse; G3 sync was "very stable".
-COPY, TRANSCODE, ISOLATED, GO = "copy", "transcode", "isolated", "go"
-_MODE_NAMES = (COPY, TRANSCODE, ISOLATED, GO)
+COPY, TRANSCODE, ISOLATED, GO, GO_AIPORT = "copy", "transcode", "isolated", "go", "go-aiport"
+_MODE_NAMES = (COPY, TRANSCODE, ISOLATED, GO, GO_AIPORT)
+_GO_MODES = (GO, GO_AIPORT)
 
 
 def _camera_id(value):
@@ -136,7 +143,7 @@ def mode_of(device_id):
     """How this camera's video runs: copy where a transcode can't run here."""
     default, per_camera = MODES
     mode = per_camera.get(_camera_id(device_id), default)
-    if mode not in (COPY, GO) and not transcode_available():
+    if mode not in (COPY, *_GO_MODES) and not transcode_available():
         if device_id not in _fell_back:
             _fell_back.add(device_id)
             log.error("camera %s is set to %s, which needs macOS and gst-launch (%s; `brew install "
@@ -146,17 +153,22 @@ def mode_of(device_id):
 
 
 def transcodes(device_id):
-    return mode_of(device_id) not in (COPY, GO)
+    return mode_of(device_id) not in (COPY, *_GO_MODES)
 
 
 def is_go(device_id):
-    return mode_of(device_id) == GO
+    return mode_of(device_id) in _GO_MODES
+
+
+def is_go_aiport(device_id):
+    """go-aiport: the sidecar pulls only the main stream and makes all three channels itself."""
+    return mode_of(device_id) == GO_AIPORT
 
 
 def any_go():
     """True when some camera (or the default) is in go mode: run_all.py then runs the sidecar."""
     default, per_camera = MODES
-    return GO in (default, *per_camera.values())
+    return any(m in _GO_MODES for m in (default, *per_camera.values()))
 
 
 def restreamer_sock(state_dir=None):
@@ -1574,8 +1586,12 @@ class GoPush:
     (restart_source) need no action: the sidecar reconnects its own pushes."""
 
     def __init__(self, device_id, channel, source_url, stream_name, destination, camera_audio,
-                 group, client, opus=(False, 0)):
-        self.host, self.port, _, _ = parse_destination(destination)  # ValueError as FlvPush
+                 group, client, opus=(False, 0), aiport=False, rate=(0, 0)):
+        self.host, self.port, self.retry_s, self.timeout_s = parse_destination(destination)  # ValueError as FlvPush
+        # go-aiport: the sidecar encodes all channels and needs the console's fps / bitrate
+        # (ChangeVideoSettings fps, bitRateVbrMax in kbps; 0 = not given) and the destination's
+        # retryInterval / connectTimeout.
+        self.aiport, self.fps, self.kbps = bool(aiport), rate[0], rate[1]
         # (withOpus, opusSampleRate) from Protect's avSerializer.parameters for this channel
         # (live 2026-11-12: true, 24000); rate 0 = not given. The sidecar sends an Opus track
         # only when asked, at that rate: Protect reads the type-10 clock in its own rate.
@@ -1604,10 +1620,14 @@ class GoPush:
     def channel_params(self):
         # A fresh GoPush is a fresh request from Protect (configure builds one per send):
         # `request` lets the sidecar un-park this channel if Protect had rejected its push.
-        return {"request": self.request, **{"channel": self.channel, "stream_name": self.stream_name,
+        params = {"request": self.request, **{"channel": self.channel, "stream_name": self.stream_name,
                 "rtsp_url": self.source_url, "dest_host": self.host, "dest_port": self.port,
                 "audio_enabled": bool(self.camera_audio), "width": 0, "height": 0,
                 "bitrate_kbps": 0, "opus": self.opus, "opus_sample_rate": self.opus_rate}}
+        if self.aiport:
+            params.update({"bitrate_kbps": self.kbps, "fps": self.fps,
+                           "retry_interval_s": self.retry_s, "connect_timeout_s": self.timeout_s})
+        return params
 
     def start(self):
         self._group[self.channel] = self
@@ -1615,7 +1635,7 @@ class GoPush:
         return self
 
     def _params(self):
-        params = {"device_id": self.device_id, "mode": "copy",
+        params = {"device_id": self.device_id, "mode": "aiport" if self.aiport else "copy",
                   "channels": [p.channel_params() for _, p in sorted(self._group.items())]}
         video1 = self._group.get("video1")
         if SHARED_DECODE and video1:
@@ -1623,6 +1643,13 @@ class GoPush:
             params["shared_decode"] = {"enabled": True, "detect_fps": self._client.detect_fps,
                                        "socket": detect_socket(video1.source_url)}
         return params
+
+    def set_rate(self, rate):
+        """The console changed this channel's fps / bitrate: re-send the camera's state (the
+        sidecar follows a bitrate change without restarting the push)."""
+        if self.aiport and rate != (self.fps, self.kbps):
+            self.fps, self.kbps = rate
+            self._client.configure(self.device_id, self._params())
 
     def restart_source(self, reason):
         log.info("push %s/%s: %s (go: the sidecar reconnects itself)", self.device_id,
@@ -1655,6 +1682,7 @@ class PushManager:
         self._sources = {}   # device_id -> {"url", "audio", "width", "height", "fps"}
         self._wanted = {}    # device_id -> {channel: (stream_name, destination)}
         self._wanted_opus = {}  # device_id -> {channel: (withOpus, opusSampleRate)}
+        self._wanted_rate = {}  # device_id -> {channel: (fps, bitrate kbps)} from the console
         self._pushes = {}    # (device_id, channel) -> FlvPush
         self._last_sent = {}  # (device_id, channel) -> last_sent of a push a re-send replaced
         self._reconnected = {}  # (device_id, channel) -> monotonic time of the last reconnect
@@ -1770,6 +1798,8 @@ class PushManager:
     def _channel_url(self, device_id, src, channel):
         """The url `channel` pushes; None while SUB_CHANNELS wait for the profiles."""
         url = src["url"]
+        if is_go_aiport(device_id):
+            return url  # the sidecar pulls the main stream once and makes every channel from it
         if transcodes(device_id) and channel in TRANSCODE_CHANNELS:
             # One pull of the main stream, started once the substream size is known.
             return None if url in self._looking_up else url
@@ -1830,6 +1860,7 @@ class PushManager:
             wanted = self._wanted.setdefault(device_id, {})
             again = set()
             for channel, settings in (video_settings or {}).items():
+                self._note_rate(device_id, channel, settings or {})
                 serializer = (settings or {}).get("avSerializer")
                 if serializer is None:
                     continue
@@ -1866,6 +1897,25 @@ class PushManager:
                     self._last_sent[key] = push.last_sent
             self._sync(device_id)
 
+    def _note_rate(self, device_id, channel, settings):
+        """Remember the console's fps / bitRateVbrMax for a channel (go-aiport encodes with them),
+        and hand a changed value to a running push. Protect sends these apart from avSerializer."""
+        if not is_go_aiport(device_id):
+            return
+        rates = self._wanted_rate.setdefault(device_id, {})
+        fps, kbps = rates.get(channel, (0, 0))
+        try:
+            if settings.get("fps"):
+                fps = float(settings["fps"])
+            if settings.get("bitRateVbrMax"):
+                kbps = int(settings["bitRateVbrMax"]) // 1000
+        except (TypeError, ValueError):
+            return
+        rates[channel] = (fps, kbps)
+        push = self._pushes.get((device_id, channel))
+        if isinstance(push, GoPush):
+            push.set_rate((fps, kbps))
+
     def stop_all(self):
         with self._lock:
             for push in self._pushes.values():
@@ -1874,6 +1924,7 @@ class PushManager:
             self._sources.clear()
             self._wanted.clear()
             self._wanted_opus.clear()
+            self._wanted_rate.clear()
             self._last_sent.clear()
 
     def _sync(self, device_id):
@@ -1902,7 +1953,9 @@ class PushManager:
                         push = self._pushes[(device_id, channel)] = GoPush(
                             device_id, channel, url, name, dest, src["audio"],
                             self._go_groups.setdefault(device_id, {}),
-                            self._restreamer, opus_of.get(channel, (False, 0))).start()
+                            self._restreamer, opus_of.get(channel, (False, 0)),
+                            aiport=is_go_aiport(device_id),
+                            rate=self._wanted_rate.get(device_id, {}).get(channel, (0, 0))).start()
                     else:
                         push = self._pushes[(device_id, channel)] = (
                             self._push_factory or FlvPush)(

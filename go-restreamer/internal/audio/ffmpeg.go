@@ -99,8 +99,8 @@ func (tc *transcoder) args() []string {
 	// -flush_packets 1: each frame leaves at once, not in pipe-buffer bursts that reach
 	// Protect as clumps of audio tags.
 	if tc.out != nil {
-		a = append(a, "-vn", "-flush_packets", "1", "-c:a", "aac", "-ar", strconv.Itoa(AACRate), "-ac", "1",
-			"-b:a", "32k", "-f", "adts", "pipe:1")
+		a = append(a, "-vn", "-flush_packets", "1", "-c:a", "aac", "-ar", strconv.Itoa(tc.cfg.aacRate()), "-ac", "1",
+			"-b:a", strconv.Itoa(tc.cfg.aacBitrate()/1000)+"k", "-f", "adts", "pipe:1")
 	}
 	if tc.opus != nil {
 		// yi-protect main.cpp: 48 kHz mono (cfg.OpusRate: the rate Protect asked for; packet durations and the Ogg granule stay on the 48 kHz clock), 20 ms frames, 64 kbps. -page_duration 20000 us:
@@ -160,6 +160,7 @@ func (tc *transcoder) supervise() {
 }
 
 func (tc *transcoder) runOnce() error {
+	aacRate := int64(tc.cfg.aacRate())
 	cmd := exec.Command(ffmpegPath(tc.cfg.FFmpegPath), tc.args()...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -212,14 +213,14 @@ func (tc *transcoder) runOnce() error {
 				if err != nil {
 					return
 				}
-				pts := base.get() + time.Duration(samples)*time.Second/AACRate
+				pts := base.get() + time.Duration(samples)*time.Second/time.Duration(aacRate)
 				if tc.codec == media.PCMU || tc.codec == media.PCMA {
 					// G.711 is one byte per 8 kHz sample, so output sample n came from input
 					// sample n*8000/AACRate: stamp it with that input's camera PTS. A pure sample
 					// count drifts from video by every lost RTP packet, every frame dropped while
 					// ffmpeg was behind, and the camera clock's skew; Protect's browser audio
 					// stuttered on the counted version (user, live 2026-11-12 on Side Door).
-					if at, ok := anchors.at(samples * 8000 / AACRate); ok {
+					if at, ok := anchors.at(samples * 8000 / aacRate); ok {
 						pts = at
 					}
 				}
