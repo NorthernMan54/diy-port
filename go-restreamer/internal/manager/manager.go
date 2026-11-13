@@ -259,8 +259,13 @@ func (m *Manager) newPusher(cam *camera, c rpc.Channel) pusher {
 		Log:           m.log.With("device", cam.id, "channel", c.Channel),
 	}
 	if c.Channel == "video1" {
-		// The detection readers' wall times are the ones this push gives Protect.
-		cfg.OnStart, cfg.OnSync, cfg.OnWrote = cam.clock.Reset, cam.clock.Synced, cam.clock.Wrote
+		// The detection readers' wall times are the ones this push gives Protect, plus the pace
+		// hold. Live 2026-11-13 10:37 on Driveway: with Pace 1000 ms boxes led the vehicle by
+		// ~1.1 s; with --pace-ms 0 they lined up. Protect places the video a Pace later than the
+		// paced wallClock suggests, so detection frames are stamped Pace later to match.
+		pace := m.opts.Pace
+		cfg.OnStart, cfg.OnWrote = cam.clock.Reset, cam.clock.Wrote
+		cfg.OnSync = func(pts time.Duration, wall time.Time) { cam.clock.Synced(pts, wall.Add(pace)) }
 	}
 	if m.opts.Tune != nil {
 		m.opts.Tune(&cfg)
