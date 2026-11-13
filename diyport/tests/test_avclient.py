@@ -1919,6 +1919,19 @@ class TestFrameStats(Base):
         line = [m for m in logs.output if "frames for deviceID=FS" in m][0]
         self.assertIn("ms a pass, box delay 1600 ms", line)
 
+    def test_shared_decode_ignores_the_box_delay(self):
+        # Shared-decode frames carry Protect's own wall time: a configured delay would only
+        # back-date boxes (live 2026-11-12 Side Door: 1600 ms -> boxes 1.6 s early).
+        with mock.patch.dict(av._BOX_DELAY_MS, {"FS": 1600}):
+            self.assertEqual(av._box_delay_ms("FS"), 1600)
+            av._shared_decoding.add("FS")
+            try:
+                self.assertEqual(av._box_delay_ms("FS"), 0)
+                av._stop_stream("FS")
+                self.assertEqual(av._box_delay_ms("FS"), 1600)
+            finally:
+                av._shared_decoding.discard("FS")
+
     def test_frame_without_a_number_is_ignored(self):
         # Live 12:39: a first pass with no frame number yet crashed every camera's loop.
         av._note_frame("FS", None, 0.02, now=1000.0)
