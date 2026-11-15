@@ -3,6 +3,7 @@
 package flv
 
 import (
+	"sync"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
@@ -549,5 +550,37 @@ func TestOpusTrailerTimescaleFollowsRate(t *testing.T) {
 	b := w.tag(w.start.Add(time.Second), tagOpus, []byte{0xF8, 0xFF, 0xFE}, 0)
 	if tr := b[len(b)-16:]; !bytes.Equal(tr[1:4], []byte{0x00, 0x5D, 0xC0}) {
 		t.Errorf("trailer % x, want timescale 0x005DC0", tr)
+	}
+}
+
+// A pace re-base must not move the detection clock: OnSync reports the wall without the
+// stall shift. Live 2026-11-15 11:24 on Driveway: a re-base (shift_ms=2013) moved the
+// detection walls 2 s (push lag 0.1 s -> 2.1 s) and boxes no longer lined up with the car.
+func TestPusherRebaseKeepsSyncWall(t *testing.T) {
+	const pace = 100 * time.Millisecond
+	var mu sync.Mutex
+	var offs []time.Duration
+	cfg := Config{StreamName: "video1", Pace: pace, OnSync: func(pts time.Duration, wall time.Time) {
+		mu.Lock()
+		offs = append(offs, time.Duration(wall.UnixNano())-pts)
+		mu.Unlock()
+	}}
+	capture(t, cfg, testTracks(), func(p *Pusher) {
+		p.OnVideo(media.VideoAU{PTS: 0, NALUs: [][]byte{{0x65, 0}}, IDR: true})
+		time.Sleep(pace + 300*time.Millisecond) // the next frame is past its slot: re-base
+		for i := 1; i <= 3; i++ {
+			p.OnVideo(media.VideoAU{PTS: time.Duration(i) * 40 * time.Millisecond, NALUs: [][]byte{{0x65, byte(i)}}, IDR: true})
+		}
+		time.Sleep(3 * pace)
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(offs) < 2 {
+		t.Fatalf("got %d syncs", len(offs))
+	}
+	for _, o := range offs[1:] {
+		if d := o - offs[0]; d > 20*time.Millisecond || d < -20*time.Millisecond {
+			t.Errorf("sync wall moved %v after the re-base (offsets %v)", d, offs)
+		}
 	}
 }

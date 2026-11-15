@@ -681,7 +681,10 @@ func (p *Pusher) pushOnce(si *startInfo) (sentAny bool) {
 					return
 				}
 				if p.cfg.OnSync != nil {
-					p.cfg.OnSync(si.base+time.Duration(it.ts)*time.Millisecond, now)
+					// Without the stall shift: Protect's playback doesn't follow a re-base.
+					// Live 2026-11-15 11:24 on Driveway: a re-base (shift_ms=2013) moved the
+					// detection walls 2 s (push lag 0.1 -> 2.1 s), and boxes stopped lining up.
+					p.cfg.OnSync(si.base+time.Duration(it.ts)*time.Millisecond, now.Add(-paceShift))
 				}
 			}
 			if write(w.tag(now, it.typ, it.body, it.ts)) != nil {
