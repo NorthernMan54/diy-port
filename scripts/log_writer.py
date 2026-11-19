@@ -41,7 +41,12 @@ class RotatingLog:
     def _reopen(self):
         if os.path.exists(self.path) and os.path.getsize(self.path) >= self.max_bytes:
             rotate(self.path, self.keep)
-        self.f = open(self.path, "ab")
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self.f = os.fdopen(fd, "ab")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
         self.size = self.f.tell()
 
     def write(self, line):

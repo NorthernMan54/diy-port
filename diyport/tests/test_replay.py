@@ -82,10 +82,9 @@ class TestReplay(unittest.TestCase):
         events = replay.summarize(sent)
         self.assertEqual(len(events), 1)
         self.assertEqual([o["type"] for o in events[0]["objects"]], ["person"])
-        # appears at 0.5 s, enters once initialised (dated back to 0.5 s), and closes
-        # AIPORT_MISS_S after it goes.
-        init_s = (av.MIN_INITIALIZED + 1) / av.DETECT_FPS
-        self.assertAlmostEqual(events[0]["start_s"], 0.5 + init_s, delta=0.3)
+        # appears at 0.5 s; the enter is dated to its first frame even though it is sent
+        # after initialization, then closes AIPORT_MISS_S after it goes.
+        self.assertAlmostEqual(events[0]["start_s"], 0.5, delta=0.1)
         walls = [p["clockWall"] for _, p in sent]
         self.assertAlmostEqual((walls[1] - walls[0]) / 1000.0, av.REPORT_INTERVAL_MS / 1000.0,
                                delta=0.15)   # back-filled from the first frame
@@ -107,7 +106,8 @@ class TestReplay(unittest.TestCase):
     def test_event_start_msec_from_sidecar(self):
         settings = {"width": 320, "height": 180, "smartDetect": {"eventStartMSec": 1000}}
         events = replay.summarize(self.run_replay(settings))
-        self.assertAlmostEqual(events[0]["start_s"], 1.5, delta=0.3)
+        # eventStartMSec delays confirmation, not the back-dated event start.
+        self.assertAlmostEqual(events[0]["start_s"], 0.5, delta=0.1)
 
     def test_avclient_left_as_it_was(self):
         before = (av.send_msg, av.LEAVE_FALLBACK_S, av.STARTUP_WINDOW_MS, av._STREAM_DIR)

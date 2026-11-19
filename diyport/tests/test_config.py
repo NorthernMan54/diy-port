@@ -135,7 +135,22 @@ class TestStreamDir(unittest.TestCase):
                          config.stream_dir(os.path.join(tmp, "instances/main")))
 
     def test_tmpfs_base_writable(self):
-        self.assertTrue(os.path.isdir(config._tmpfs_base()))
+        base = config._tmpfs_base()
+        self.assertTrue(os.path.isdir(base))
+        fd, probe = tempfile.mkstemp(dir=base)
+        os.close(fd)
+        os.unlink(probe)  # a read-only base would raise here, not just later
+
+    def test_make_stream_dir_fixes_an_existing_parent(self):
+        # An older version (or another user) may have made the shared parent 0755.
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = os.path.join(tmp, "aiport-streams")
+            os.mkdir(parent)
+            os.chmod(parent, 0o755)
+            path = os.path.join(parent, "instance")
+            config.make_stream_dir(path)
+            self.assertTrue(os.path.isdir(path))
+            self.assertEqual(os.stat(parent).st_mode & 0o7777, 0o1777)
 
 
 class TestLoadConfig(unittest.TestCase):
@@ -198,6 +213,22 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg["guid"], env["AIPORT_GUID"])
 
 
+class TestStateDir(unittest.TestCase):
+    def test_default_is_outside_the_repo(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/srv/state"}):
+            self.assertEqual(config.default_state_dir(), "/srv/state/diyport")
+        self.assertNotEqual(config.default_state_dir(), config.HERE)
+
+    def test_repo_state_is_copied_once(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            with open(os.path.join(src, "adopt_state.json"), "w") as f:
+                f.write("{}")
+            with mock.patch.object(config, "HERE", src):
+                self.assertEqual(config.migrate_repo_state(dst), ["adopt_state.json"])
+                self.assertEqual(config.migrate_repo_state(dst), [])
+            self.assertTrue(os.path.exists(os.path.join(dst, "adopt_state.json")))
+
+
 class TestFirmwarePin(unittest.TestCase):
     """A simulated update pins a version; every stage reports it over the configured one."""
 
@@ -230,12 +261,12 @@ class TestFirmwarePin(unittest.TestCase):
 
 class TestRedact(unittest.TestCase):
     def test_rtsp_credentials(self):
-        line = ("payload={'streamUrl': 'rtsp://onvif:s3cret@192.168.1.22/Streaming/Channels/101"
+        line = ("payload={'streamUrl': 'rtsp://onvif:s3cret@192.0.2.22/Streaming/Channels/101"
                 "?transportmode=unicast', 'width': 3840}")
         out = config.redact(line)
         self.assertNotIn("s3cret", out)
         self.assertNotIn("onvif:", out)
-        self.assertIn("rtsp://<redacted>@192.168.1.22/Streaming/Channels/101", out)
+        self.assertIn("rtsp://<redacted>@192.0.2.22/Streaming/Channels/101", out)
 
     def test_password_and_token_fields(self):
         out = config.redact('body={"username": "ui", "password": "FAKEPASS", "token": "FAKE"}')
@@ -270,7 +301,7 @@ class TestRedact(unittest.TestCase):
             self.assertNotIn("p@ssw0rd", out)
 
     def test_leaves_ordinary_text(self):
-        for line in ("connecting to wss://192.168.1.2:7442/ with headers={'X-Ident': 'fc'}",
+        for line in ("connecting to wss://192.0.2.2:7442/ with headers={'X-Ident': 'fc'}",
                      "starting merged RTSP pull for deviceID=D: rtsp://10.0.0.1:7447/abc"):
             self.assertEqual(config.redact(line), line)
 

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0 AND AGPL-3.0-or-later
 # Copyright (C) 2026 hutchx86
 """Detection post-processing shared by every detector backend.
 

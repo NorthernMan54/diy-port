@@ -12,14 +12,21 @@ import os
 log = logging.getLogger("aiport-env")
 
 OFF = ("0", "false", "no", "off")
+ON = ("1", "true", "yes", "on")
 
 
 def env_bool(name, default):
-    """True unless set to 0/false/no/off; `default` when unset or empty."""
+    """True/false from 1/true/yes/on and 0/false/no/off; `default` when unset, empty or
+    misspelled, as the module docstring promises."""
     v = (os.environ.get(name) or "").strip().lower()
     if not v:
         return default
-    return v not in OFF
+    if v in OFF:
+        return False
+    if v in ON:
+        return True
+    log.warning("ignoring bad %s=%r: using %s", name, v, default)
+    return default
 
 
 def _env_number(name, default, cast):

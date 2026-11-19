@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 """One process per ONVIF camera for its video push to Protect (AIPORT_ONVIF_MODE=isolated).
 
 PushManager keeps deciding what each camera should push: channels, stream names, sizes, the
@@ -15,6 +16,8 @@ orders over the Protect connection in avclient, so if avclient dies the process 
 
 The process reads JSON commands, one per line, on stdin and exits when stdin closes, so it can't
 outlive avclient. It reports each channel's last video to Protect on stdout once a second.
+With shared decode on (the default for a transcoded camera), detection reads this process's
+video1 socket, so replacing a dead process briefly interrupts that camera's detection too.
 """
 import json
 import logging
@@ -41,6 +44,14 @@ def uses_process(device_id):
     return onvif_push.mode_of(device_id) == onvif_push.ISOLATED
 
 
+def _command_summary(command):
+    """A command safe to log: never the RTSP login."""
+    safe = dict(command)
+    if isinstance(safe.get("url"), str):
+        safe["url"] = onvif_push._describe(safe["url"])
+    return safe
+
+
 class RemotePush:
     """What PushManager needs of an FlvPush, for one running in the camera's process."""
 
@@ -57,9 +68,10 @@ class RemotePush:
         self.renditions = renditions
         self.last_sent = time.monotonic()
 
-    def matches(self, source_url, stream_name, destination, renditions=None):
-        return (self.source_url, self.stream_name, self.destination, self.renditions) == \
+    def matches(self, source_url, stream_name, destination, renditions=None, camera_audio=None):
+        same = (self.source_url, self.stream_name, self.destination, self.renditions) == \
                (source_url, stream_name, destination, renditions)
+        return same and (camera_audio is None or bool(camera_audio) == bool(self.camera_audio))
 
     def start(self):
         self.worker.add(self)
@@ -70,6 +82,9 @@ class RemotePush:
 
     def restart_source(self, reason):
         self.worker.send({"op": "restart_source", "channel": self.channel, "reason": reason})
+
+    def reconnect(self, reason):
+        self.worker.send({"op": "reconnect", "channel": self.channel, "reason": reason})
 
     def command(self):
         return {"op": "start", "channel": self.channel, "url": self.source_url,
@@ -167,12 +182,16 @@ class Worker:
 
     def _read(self, proc, reported):
         started = time.monotonic()
-        for line in proc.stdout:
-            reported[0] = time.monotonic()
-            try:
-                self._note_report(json.loads(line)["sent"], reported[0])
-            except (ValueError, KeyError, TypeError):
-                log.warning("restream process for %s: bad report %r", self.device_id, line[:200])
+        try:
+            for line in proc.stdout:
+                reported[0] = time.monotonic()
+                try:
+                    self._note_report(json.loads(line)["sent"], reported[0])
+                except (ValueError, KeyError, TypeError):
+                    log.warning("restream process for %s: bad report %r", self.device_id,
+                                line[:200])
+        except Exception:
+            log.exception("restream process for %s: report reader failed", self.device_id)
         rc = proc.wait()
         with self._lock:
             if self.proc is not proc:   # retired: it stopped its own pushes on the way out
@@ -182,7 +201,7 @@ class Worker:
         self._failures = 0 if lasted >= RESPAWN_HEALTHY_S else self._failures + 1
         wait = min(RESPAWN_MAX_S, 2.0 ** self._failures) if self._failures else 1.0
         log.warning("restream process for %s exited rc=%s after %.0f s, replacing it in %.0f s; "
-                    "detection is not affected", self.device_id, rc, lasted, wait)
+                    "its pushes resume when replaced", self.device_id, rc, lasted, wait)
         time.sleep(wait)
         self._respawn_if_wanted(proc)
 
@@ -277,6 +296,11 @@ class Process:
                 entry = self.pushes.get(channel)
             if entry:
                 entry[0].restart_source(command.get("reason") or "asked to")
+        elif op == "reconnect":
+            with self.lock:
+                entry = self.pushes.get(channel)
+            if entry:
+                entry[0].reconnect(command.get("reason") or "asked to")
         else:
             log.warning("restream process for %s: unknown command %r", self.device_id, command)
 
@@ -324,10 +348,18 @@ def main(argv):
     try:
         for line in commands:
             try:
-                process.handle(json.loads(line))
+                command = json.loads(line)
+            except ValueError:
+                # Do not echo malformed input: truncating it can cut before the '@' and
+                # leave a password fragment in the log.
+                log.warning("restream process for %s: bad command (%d bytes, not logged)",
+                            device_id, len(line.rstrip("\n")))
+                continue
+            try:
+                process.handle(command)
             except Exception:
                 log.exception("restream process for %s: command failed: %s", device_id,
-                              line[:200])
+                              _command_summary(command))
     finally:
         process.stop_all()
     log.info("restream process for %s exiting", device_id)

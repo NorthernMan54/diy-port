@@ -58,10 +58,8 @@ FACE_MATCH_MIN_PX = envutil.env_int("AIPORT_FACE_MATCH_MIN_PX", 40)
 # embedding makes a bad enrolment.
 FACE_EMBED_MIN_NORM = envutil.env_float("AIPORT_FACE_EMBED_MIN_NORM", 7.0)
 
-# A face whose vector is shorter still isn't a face to show at all: the back of a head or a face
-# turned away (live 12:36-12:40 on Driveway: backs of heads 3.3 and 4.3, turned away 5.9; faces
-# 6.7-8.8, in profile too). Dropped once at least FACE_MATCH_MIN_PX, where the length means
-# something. AIPORT_FACE_DROP_NORM=0 keeps them all.
+# A short SFace vector (back of a head, face turned away) is dropped once the face is
+# at least FACE_MATCH_MIN_PX; AIPORT_FACE_DROP_NORM=0 keeps them.
 FACE_DROP_NORM = envutil.env_float("AIPORT_FACE_DROP_NORM", 6.0)
 
 
@@ -273,8 +271,7 @@ class Enricher:
             try:
                 alpr = self._get_alpr()
             except Exception:
-                log.exception("plate model load failed -- plates disabled")
-                self.lpr = False
+                log.exception("plate model load failed -- will retry")
                 return []
             for parent, coord in enumerate(vehicle_coords):
                 x1, y1, x2, y2 = _expand_px(coord, iw, ih)
@@ -313,8 +310,7 @@ class Enricher:
             try:
                 yunet, sface = self._get_face_models()
             except Exception:
-                log.exception("face model load failed -- faces disabled")
-                self.face = False
+                log.exception("face model load failed -- will retry")
                 return []
             self._refresh_gallery(yunet, sface)
             for parent, coord in enumerate(person_coords):
@@ -359,6 +355,7 @@ class Enricher:
         """(Re)load <faces_dir>/<Name>/*.jpg when anything in it changed."""
         if sface is None or not self.faces_dir or not os.path.isdir(self.faces_dir):
             self._gallery = []
+            self._gallery_stamp = None  # rebuild when the directory returns
             return
         files = []
         for name in sorted(os.listdir(self.faces_dir)):

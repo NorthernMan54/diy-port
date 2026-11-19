@@ -28,13 +28,14 @@ log = logging.getLogger("aiport-ucp4-client")
 _PROCESS_START_MS = int(time.time() * 1000)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
-CERT_PATH = os.path.join(HERE, "server.crt")
-KEY_PATH = os.path.join(HERE, "server.key")
+DEFAULT_STATE_DIR = config.default_state_dir()
+ADOPT_STATE_FILE = os.path.join(DEFAULT_STATE_DIR, "adopt_state.json")
+CERT_PATH = os.path.join(DEFAULT_STATE_DIR, "server.crt")
+KEY_PATH = os.path.join(DEFAULT_STATE_DIR, "server.key")
 # RAM-only snapshot dir avclient.py's ffmpeg writes; same dir http_api.py serves.
 STREAM_DIR = config.stream_dir()
-# --state-dir (or None for the shared diyport/ path); the firmware pin lives here.
-STATE_DIR = None
+# --state-dir overrides this; the firmware pin lives here.
+STATE_DIR = DEFAULT_STATE_DIR
 
 # UCP4 record header (8 bytes): type u8, format u8, compressed u8, reserved u8,
 # length u32 BE (the controller reads length at offset 4, matching this layout).
@@ -336,10 +337,8 @@ def main():
                           "shows up within --fallback-after seconds")
     ap.add_argument("--fallback-after", type=float, default=10.0)
     ap.add_argument("--state-dir", default=None,
-                     help="where adopt_state.json/server.crt/server.key live -- defaults "
-                          "to the shared diyport/ path (single-instance, unchanged "
-                          "behavior); set this to isolate a second/third AI Port instance "
-                          "running on the same box (see instance_manager.py)")
+                     help="where adopt_state.json/server.crt/server.key live; defaults to "
+                          "$XDG_STATE_HOME/diyport or ~/.local/state/diyport")
     args = ap.parse_args()
     args.iface = config.resolve_iface(args.iface, cfg)
 

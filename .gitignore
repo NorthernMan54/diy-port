@@ -33,6 +33,9 @@ run_all.log
 # Python
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
 
 # Windows metadata
 *:Zone.Identifier

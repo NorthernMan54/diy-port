@@ -26,6 +26,8 @@ class TestEnv(unittest.TestCase):
             self.assertFalse(envutil.env_bool("AIPORT_T", False))  # empty -> default
         with self.env("1"):
             self.assertTrue(envutil.env_bool("AIPORT_T", False))
+        with self.env("of"), self.assertLogs("aiport-env", "WARNING"):
+            self.assertFalse(envutil.env_bool("AIPORT_T", False))  # typo -> default
 
     def test_number_typo_is_default_not_crash(self):
         # A bare float() at import used to take the instance down on a diyport.env typo.

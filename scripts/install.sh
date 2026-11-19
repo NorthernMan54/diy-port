@@ -56,6 +56,7 @@ RKNN=""
 RKNN_URL=""
 RKNN_SHA256=""
 WEBUI_PORT="8090"
+WEBUI_BIND="127.0.0.1"
 ACCEL="auto"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -83,6 +84,7 @@ Usage: sudo scripts/install.sh --console <UNVR-IP> [options]
   --rknn-url URL          download the .rknn from URL (overrides DIYPORT_RKNN_URL)
   --rknn-sha256 HEX       verify a downloaded/supplied .rknn
   --webui-port N          web UI listen port (default: 8090)
+  --webui-bind ADDR       web UI bind address (default: 127.0.0.1; use 0.0.0.0 for LAN)
   --no-npu                same as --accel none: no detector runtime or model
   -h, --help
 EOF
@@ -98,6 +100,7 @@ while [ $# -gt 0 ]; do
         --rknn-url)     RKNN_URL="${2:?}"; shift 2 ;;
         --rknn-sha256)  RKNN_SHA256="${2:?}"; shift 2 ;;
         --webui-port)   WEBUI_PORT="${2:?}"; shift 2 ;;
+        --webui-bind)   WEBUI_BIND="${2:?}"; shift 2 ;;
         --accel)        ACCEL="${2:?}"; shift 2 ;;
         --no-npu)       ACCEL="none"; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -448,7 +451,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$DIYPORT_DIR
-ExecStart=$PY $DIYPORT_DIR/sysinfo_server.py --bind-ip 0.0.0.0 --port $WEBUI_PORT
+ExecStart=$PY $DIYPORT_DIR/sysinfo_server.py --bind-ip $WEBUI_BIND --port $WEBUI_PORT
 Restart=on-failure
 RestartSec=5
 
@@ -462,7 +465,9 @@ systemctl restart diyport-webui.service
 
 box_ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
 sleep 1
-if curl -fsS "http://127.0.0.1:${WEBUI_PORT}/api/stats" >/dev/null 2>&1; then
+webui_check_ip=$WEBUI_BIND
+[ "$WEBUI_BIND" = "0.0.0.0" ] && webui_check_ip=127.0.0.1
+if curl -fsS "http://${webui_check_ip}:${WEBUI_PORT}/api/stats" >/dev/null 2>&1; then
     webui_state="up"
 else
     webui_state="NOT responding (check: journalctl -u diyport-webui -n 50)"
@@ -481,7 +486,7 @@ DIY Port installed.
 
   console        : $cfg_host
   instance unit  : aiport-instance-${NAME}.service  ($instance_state)
-  web UI         : http://${box_ip:-<box-ip>}:${WEBUI_PORT}   [$webui_state]
+  web UI         : http://${WEBUI_BIND/0.0.0.0/${box_ip:-<box-ip>}}:${WEBUI_PORT}   [$webui_state]
   logs           : journalctl -u aiport-instance-${NAME} -f
                    journalctl -u diyport-webui -f
 

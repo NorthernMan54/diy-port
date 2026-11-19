@@ -23,9 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
-# --state-dir (or None for the shared diyport/ path); the firmware pin lives here.
-STATE_DIR = None
+DEFAULT_STATE_DIR = config.default_state_dir()
+ADOPT_STATE_FILE = os.path.join(DEFAULT_STATE_DIR, "adopt_state.json")
+# --state-dir overrides this; the firmware pin lives here.
+STATE_DIR = DEFAULT_STATE_DIR
 
 log = logging.getLogger("aiport-discovery")
 
@@ -126,10 +127,8 @@ def main():
     ap.add_argument("--fw-version", default=cfg["discovery_fw_version"])
     ap.add_argument("--device-id", default=cfg["device_id"])
     ap.add_argument("--state-dir", default=None,
-                     help="where adopt_state.json lives -- defaults to the shared "
-                          "diyport/ path (single-instance, unchanged behavior); "
-                          "set this to isolate a second/third AI Port instance running "
-                          "on the same box (see instance_manager.py)")
+                     help="where adopt_state.json lives; defaults to "
+                          "$XDG_STATE_HOME/diyport or ~/.local/state/diyport")
     args = ap.parse_args()
     args.iface = config.resolve_iface(args.iface, cfg)
 

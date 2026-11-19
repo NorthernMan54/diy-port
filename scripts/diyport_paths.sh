@@ -1,4 +1,7 @@
+#!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
+# shellcheck disable=SC2034  # sourced: the caller uses these variables
 # Where a diy-port instance keeps its files, sourced by diyport_service.sh and macos_launchd.sh
 # (set USER_HOME first). Each instance has a folder of its own:
 #

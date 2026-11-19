@@ -33,7 +33,6 @@ STUB = textwrap.dedent("""\
     """)
 
 
-@unittest.skipUnless(sys.platform == "darwin", "the script uses macOS stat -f")
 class TestServiceScript(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -156,6 +155,7 @@ class TestLogWriter(unittest.TestCase):
 
     def test_rotates_at_the_size_and_keeps_the_newest(self):
         log = log_writer.RotatingLog(self.path, max_bytes=100, keep=2)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
         for i in range(12):
             log.write(b"line %02d %s\n" % (i, b"x" * 30))   # 40 bytes each
         log.close()
@@ -182,6 +182,101 @@ class TestLogWriter(unittest.TestCase):
         self.assertEqual(proc.stdout, b"")                 # not a terminal: no echo
         with open(self.path, "rb") as f:
             self.assertEqual(f.read(), b"one\ntwo\n")
+
+
+class TestStaleGroup(unittest.TestCase):
+    """A dead run_all.py leader must not hide its orphaned stage children."""
+
+    LEADER = textwrap.dedent("""\
+        import os, signal, subprocess, sys, time
+        out = os.environ["STUB_OUT"]
+        child = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avclient.py")
+        p = subprocess.Popen([sys.executable, child])
+        with open(out, "a") as f:
+            f.write("leader %d child %d\\n" % (os.getpid(), p.pid))
+        def stop(sig, frame):
+            p.terminate()
+            p.wait()
+            sys.exit(0)
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGTERM, stop)
+        while True:
+            time.sleep(0.2)
+    """)
+    CHILD = "import time\nwhile True: time.sleep(0.2)\n"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        repo = os.path.join(self.dir, "repo")
+        os.makedirs(os.path.join(repo, "venv", "bin"))
+        os.makedirs(os.path.join(repo, "diyport"))
+        os.symlink(sys.executable, os.path.join(repo, "venv", "bin", "python"))
+        with open(os.path.join(repo, "diyport", "run_all.py"), "w") as f:
+            f.write(self.LEADER)
+        with open(os.path.join(repo, "diyport", "avclient.py"), "w") as f:
+            f.write(self.CHILD)
+        self.env_file = os.path.join(self.dir, "diyport.env")
+        with open(self.env_file, "w") as f:
+            f.write("DIYPORT_IFACE=en0\nDIYPORT_MAC=AA\nDIYPORT_DEVICE_ID=dev\n")
+        self.out = os.path.join(self.dir, "stub.out")
+        self.pidfile = os.path.join(self.dir, "service.pid")
+        self.env = dict(os.environ, DIYPORT_SERVICE_TEST=repo,
+                        DIYPORT_ENV_FILE=self.env_file,
+                        DIYPORT_LOG=os.path.join(self.dir, "service.log"),
+                        DIYPORT_PIDFILE=self.pidfile, STUB_OUT=self.out)
+        self.proc = None
+        self.children = []
+
+    def tearDown(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        if self.proc is not None:
+            self.proc.stdout.close()
+        for pid in self.children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def _lines(self):
+        try:
+            with open(self.out) as f:
+                return [line.split() for line in f if line.startswith("leader ")]
+        except FileNotFoundError:
+            return []
+
+    def test_orphaned_stage_children_are_stopped(self):
+        self.proc = subprocess.Popen(["/bin/bash", SCRIPT], env=self.env,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT)
+        deadline = time.time() + 10
+        while time.time() < deadline and not self._lines():
+            time.sleep(0.1)
+        first = self._lines()[0]
+        leader, child = int(first[1]), int(first[3])
+        self.children.append(child)
+        os.kill(leader, signal.SIGKILL)
+        deadline = time.time() + 20
+        while time.time() < deadline and len(self._lines()) < 2:
+            time.sleep(0.2)
+        self.assertGreaterEqual(len(self._lines()), 2)
+        deadline = time.time() + 5
+        while time.time() < deadline and _alive(child):
+            time.sleep(0.1)
+        self.assertFalse(_alive(child))
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":

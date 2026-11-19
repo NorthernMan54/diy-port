@@ -221,7 +221,7 @@ URLs from it, and the device's own IP left paired cameras without thumbnails.
 | `ChangeVideoSettings` | A query, not a push. | `{video:{video1:{enabled,width,height,fps,bitrate},video2,video3}, audio:{...}}` - `{}` blocks provisioning. |
 | `ChangeIspSettings` | Query. | `{irLedMode:"auto", wdr:1}` |
 | `ChangeSmartDetectSettings` | Zones for a paired camera: `zones`, `excludeZones`, `lines` (vertices 0–1000), and `eventStartMSec`. | Stored per `deviceID`; detections outside detect zones / inside exclude zones are dropped; lines drive Line Crossing; `eventStartMSec` is how long a new track must be seen before it joins the event (section 5). Per-zone sensitivity isn't applied. |
-| `ChangeSmartMotionSettings` | Includes `eventMaxDurationMSec` (default 5 min). | Stored; the device ends long events itself. |
+| `ChangeSmartMotionSettings` | Enhanced motion. `enable`, `zones`, `lingerEventStartMSec`, `lingerEventStopMSec` and `eventMaxDurationMSec` (default 5 min). | Stored; drives `EventSmartMotion`: start after motion persists for the linger-start time, stop after the linger-stop time with no motion, and split the event at the max duration. Nothing is sent until `enable` is true. |
 | `GetRequest` (`what` contains `snapshot`) | Fetch a thumbnail named in an earlier event: `filename`, `uri`, `what`, `deviceID`. | Ack `{}`, then upload the JPEG to `uri` (section 6). |
 | `UpdateFaceDBRequest` | URL of Protect's known-faces DB. | Ack, download to `<state>/facedb/known.db` (matching not implemented). |
 | `ChangeDeviceSettings` | Rename etc. | Persist `name` (so discovery TLV `0x0B` matches); reply `{name, timezone}`. |
@@ -320,6 +320,26 @@ within 4 s, the device resends a proven single-tracker leave (priority face > pe
 `linesStatus: {"<ref>": {level, status, direction, crosslineA2B, crosslineB2A}}`;
 its leave's `trackerIDAttrMap` names `line` instead of `zone`. Line events stay per
 track. Implemented but not yet verified against a live console.
+
+**`EventSmartMotion`** - ordinary motion, which Protect does not take from a paired
+camera. Protect 7.3.70 parses this shape (`motionMessageAjvParseRaw`):
+
+```json
+{
+  "deviceID": "AABBCCDDEEFF",
+  "clockBestMonotonic": 0, "clockBestWall": 1760000000000,
+  "clockMonotonic": 1234, "clockStream": 1234, "clockStreamRate": 1000,
+  "clockWall": 1760000000000,
+  "edgeType": "start", "eventId": 1, "eventType": "motion",
+  "motionHeatmap": "", "motionSnapshot": ""
+}
+```
+
+`edgeType` is `start` or `stop`; `eventType` is `motion` (a `pulse` only updates the
+event's score). The 1 s start / 3 s stop linger and the 5 min maximum come from
+`ChangeSmartMotionSettings`, and each stream starts a new `eventId` sequence. The
+heatmap and snapshot strings may be empty; diy-port does not generate them, so
+Protect records the motion event but has no heatmap for its overlay.
 
 **`EventUpdateFirmwareStatus`** - `{status: "FW_DOWNLOADING" | "FW_UPDATING"}` during
 the faked update.

@@ -48,48 +48,11 @@ from procutil import start_stderr_drain
 
 log = logging.getLogger("aiport-onvif")
 
-# The channels that carry the camera's substream when it has one: UniFi's medium
-# and low channels are 720p and 360p, and video2 on the main stream made grids and
-# the app pull full resolution.
+# video2/video3 carry the camera's substream when it has one; UniFi medium/low are 720p/360p.
 SUB_CHANNELS = ("video2", "video3")
 
-# An ONVIF camera's video runs one of four ways, set by AIPORT_ONVIF_MODE: a default, then any
-# per-camera exceptions, as `isolated,AABBCCDDEEFF=copy`, so cameras can move one at a time.
-#   copy (the default)  below's "copy"; pushes run in avclient. Works anywhere.
-#   transcode           below's "option C"; pushes run in avclient.
-#   isolated            option C, with pushes in a process per camera (onvif_restream.py).
-#   go-aiport           go, but the sidecar rebuilds the real AI Port's ONVIF video path
-#                       byte for byte (docs/aiport-onvif-push-spec.md, firmware v5.1.12): one pull
-#                       of the main stream, three hardware encodes (video1 source size, video2
-#                       width 1280 at 24 fps, video3 width 640) and ubnt_streamer's FLV (sorted
-#                       AMF keys, absolute-monotonic trailers, onMpma/onClockSync per key frame,
-#                       no silent audio filler). `go` keeps the proven ffmpeg-era push.
-#   go                  a Go sidecar (go-restreamer/, supervised by run_all.py) pulls and pushes;
-#                       this process only sends it configure_camera / remove_camera over a unix
-#                       socket (RestreamerClient). Needs no gst-launch. Shared decode reads the
-#                       sidecar's DetectServer at the same detect_socket() path.
-#
-# copy: ffmpeg pulls the camera's main stream and substream and copies them.
-#
-# Option C: what the AI Port itself does with an ONVIF camera. Its ubnt_av_aiport
-# (v5.1.12, Ghidra) pulls the main stream once with rtspsrc protocols=tcp latency=500
-# tcp-timeout=5000000, decodes it once (v4l2dec) and re-encodes one stream per channel (S0
-# with a 1 s GOP, S1 GOP 24 at 2 Mbps, S2 at 300 kbps), so every channel Protect plays was
-# made by its own encoder at a steady rate. Here one gst-launch does the same with
-# VideoToolbox (vtdec, one vtenc_h264 per channel), each channel on its own pipe: one RTSP
-# session per camera instead of main + substream. video2 is encoded at the substream's size
-# and video3 at TRANSCODE_VIDEO3_HEIGHT, as Protect is told (ChangeVideoSettings). macOS
-# only; needs `brew install gstreamer` (1.28.8 tested). Live 2026-11-03/04 on Driveway: the
-# user found it more stable than ffmpeg or a copied GStreamer pull, with a better picture,
-# and it held 20 fps for 10 h 48 min.
-#
-# It also sends clock syncs as yi-protect's FlvPush does, "matching a real G3": onMpma +
-# onClockSync at connection start (after onMetaData, before the codec configs), then
-# onClockSync + onMpma before every key frame, 10 s fallback. Live 02:22 on Driveway
-# (2026-11-03): Protect plays this camera through an fMP4 player with useWallClock=1
-# (unifi-cam-proxy's Driveway gets a UBNT one), and with a sync every 5 s a cold start played
-# ~1 s then paused ~5 s, as if waiting for the next sync to place frames on the wall clock.
-# A sync every 1 s was worse; G3 sync was "very stable".
+# AIPORT_ONVIF_MODE: copy, transcode, isolated, go or go-aiport (per-camera exceptions allowed).
+# See docs/onvif-modes.md for the pipelines, G3 clock syncs and the live measurements.
 COPY, TRANSCODE, ISOLATED, GO, GO_AIPORT = "copy", "transcode", "isolated", "go", "go-aiport"
 _MODE_NAMES = (COPY, TRANSCODE, ISOLATED, GO, GO_AIPORT)
 _GO_MODES = (GO, GO_AIPORT)
@@ -107,6 +70,19 @@ def parse_camera_list(value):
     if value in ("1", "true", "yes", "on"):
         return True
     return {_camera_id(d) for d in value.split(",") if d.strip()}
+
+
+# AIPORT_ONVIF_CAMERA_TIMESTAMPS (camera list, as AIPORT_ONVIF_AUDIO_OFF): keep those cameras'
+# own frame timestamps instead of arrival stamps, which carry network jitter into the video.
+CAMERA_TIMESTAMPS = parse_camera_list(os.environ.get("AIPORT_ONVIF_CAMERA_TIMESTAMPS"))
+
+
+def use_camera_timestamps(device_ids, setting=None):
+    """Whether a pull feeding these cameras keeps the camera's timestamps."""
+    setting = CAMERA_TIMESTAMPS if setting is None else setting
+    if setting is True:
+        return True
+    return bool(setting) and any(_camera_id(d) in setting for d in device_ids)
 
 
 def parse_modes(value):
@@ -131,6 +107,14 @@ def parse_modes(value):
 
 MODES = parse_modes(os.environ.get("AIPORT_ONVIF_MODE"))
 _fell_back = set()  # cameras already logged as falling back to copy
+_codecs = {}        # camera id -> probed video codec (h264, hevc, ...)
+_codec_fell_back = set()
+
+
+def note_codec(device_id, codec):
+    """Remember the probed video codec; None leaves the last known value alone."""
+    if codec:
+        _codecs[_camera_id(device_id)] = str(codec).lower()
 
 
 def transcode_available():
@@ -153,7 +137,18 @@ def mode_of(device_id):
 
 
 def transcodes(device_id):
-    return mode_of(device_id) not in (COPY, *_GO_MODES)
+    mode = mode_of(device_id)
+    if mode in (COPY, *_GO_MODES):
+        return False
+    key = _camera_id(device_id)
+    codec = _codecs.get(key)
+    if codec and codec not in ("h264", "avc"):
+        if key not in _codec_fell_back:
+            _codec_fell_back.add(key)
+            log.error("camera %s is %s; transcode/isolated need H.264, using copy", device_id,
+                      codec)
+        return False
+    return True
 
 
 def is_go(device_id):
@@ -194,14 +189,11 @@ GST_LATENCY_MS = 500
 GST_BIN = (shutil.which("gst-launch-1.0")
            or "/opt/homebrew/bin/gst-launch-1.0")  # launchd's PATH has no Homebrew
 TRANSCODE_VIDEO3_HEIGHT = 360
-# A TRANSCODE pipeline with a channel that has produced no video for this long is replaced
-# (0: never). Live 2026-11-03 17:24 on Driveway: gst-launch stayed alive with its RTSP socket
-# CLOSED and no output for 2.5 h. Only Protect's re-sends could end that, and a hang with
-# none went uncaught. Detection has its own pull and is left alone.
+# Replace a transcode pipeline with no video for this long (0: never). A gst hang can
+# keep its RTSP socket closed with no output; Protect re-sends alone will not end it.
 TRANSCODE_STALL_S = envutil.env_float("AIPORT_ONVIF_STALL_S", 30)
-# A settings re-send only replaces the pipeline when a channel has been silent this long.
-# Otherwise it reconnects just that push: a restart costs all three channels and a camera
-# session, and encoders that are still producing can't be why Protect lost one stream.
+# A re-send only replaces the pipeline when a channel has been silent this long; otherwise
+# just reconnect that push, since a restart costs all channels and a camera session.
 RESEND_RESTART_QUIET_S = 5.0
 
 
@@ -337,9 +329,8 @@ class ExtendedFlvWriter:
         self.g3_sync = g3_sync
         self.clock = clock
         self.now = self.start = self.last_sync = None
-        # Sync right after the first video frame, not 5 s in: Protect's ms drops a
-        # recording file that closes before its first sync ("no last known clock sync
-        # - dropping"), which lost the first ~5 s after every reconnect (live 2026-10-28).
+        # Sync immediately after the first video frame: Protect's ms drops a recording that closes
+        # before its first sync.
         self.early_sync = early_sync
         self._sync_next = False
         self.on_sync = None  # (streamClock ms, wallClock ms) of each onClockSync sent
@@ -483,7 +474,30 @@ def parse_destination(dest):
     return parts.hostname, parts.port, retry, timeout
 
 
-def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True):
+_BAD_URL_CHARS = set(' \t\r\n!"\\')
+
+
+def validate_stream_url(url):
+    """Only a normal RTSP(S) URL may reach ffmpeg or gst-launch."""
+    if not isinstance(url, str) or not url or any(c in _BAD_URL_CHARS for c in url) \
+            or any(ord(c) < 32 for c in url):
+        raise ValueError("stream URL is not a plain RTSP URL")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"bad stream URL: {exc}") from exc
+    if parts.scheme.lower() not in ("rtsp", "rtsps") or not parts.hostname:
+        raise ValueError("stream URL must be rtsp:// or rtsps://")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("stream URL has an invalid port")
+    if parts.fragment:
+        raise ValueError("stream URL must not have a fragment")
+    return url
+
+
+def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy_audio=True,
+                    wallclock=True):
     """Camera video copied (no re-encode) plus an audio track into FLV on stdout.
     Protect's ingest only marks a stream ready (live view, recording) with both
     tracks present -- the extendedFlv header always flags audio+video -- so a
@@ -492,11 +506,15 @@ def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy
     The camera's audio is copied (FLV carries G.711 and AAC as they are), as
     unifi-cam-proxy runs here with -c:a copy. Re-encoding G.711 to AAC made
     Protect's live view stop and start every second (live 2026-10-28);
-    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus)."""
+    `copy_audio=False` re-encodes, for audio FLV can't hold (e.g. Opus).
+    `wallclock=False` keeps the camera's timestamps (see CAMERA_TIMESTAMPS)."""
+    validate_stream_url(source_url)
     cmd = [
         ffmpeg_bin, "-nostdin", "-loglevel", "error",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts+discardcorrupt",
-        "-use_wallclock_as_timestamps", "1", "-timeout", "15000000",
+    ] + (["-use_wallclock_as_timestamps", "1"] if wallclock else []) + [
+        "-timeout", "15000000",
+        "-protocol_whitelist", "rtsp,tcp,udp,rtp,tls",
         "-rtsp_transport", "tcp", "-i", source_url,
     ]
     aac = ["-c:a", "aac", "-ar", "32000", "-ac", "1", "-b:a", "32k"]
@@ -511,9 +529,8 @@ def ffmpeg_push_cmd(ffmpeg_bin, source_url, stream_name, camera_audio=True, copy
     ]
 
 
-# GStreamer can't copy "whatever the camera sends" in one pipeline (parsebin dropped
-# Driveway's G.711 mu-law, live 2026-11-02 03:42), so TranscodePull tries each depayloader in
-# turn until one negotiates, and re-encodes to AAC as ffmpeg's fallback does.
+# Transcode tries each audio depayloader because one pipeline cannot copy every camera
+# format; it re-encodes to AAC like ffmpeg's fallback.
 GST_AUDIO = ("pcmu", "pcma", "aac", "encode")
 _GST_AAC = ["audioconvert", "!", "audioresample", "!", "audio/x-raw,rate=32000,channels=1",
             "!", "avenc_aac", "bitrate=32000", "!", "aacparse", "!", "mux.audio"]
@@ -529,6 +546,7 @@ def transcode_cmd(gst_bin, source_url, outputs, camera_audio=True, audio="pcmu",
     one encoder + flvmux per output, each written to its own fd. outputs is
     [(fd, width, height, fps, kbps, gop)]; a None size or fps keeps the camera's. The audio
     (copied, or silent AAC) is teed to every mux."""
+    validate_stream_url(source_url)
     cmd = [gst_bin, "-q",
            "rtspsrc", f"location={source_url}", "protocols=tcp", f"latency={int(latency_ms)}",
            "tcp-timeout=5000000", "teardown-timeout=2000000000", "name=src",
@@ -654,6 +672,9 @@ class SharedPull:
         self.source_url = source_url
         self.camera_audio = camera_audio
         self.ffmpeg_bin = ffmpeg_bin
+        # The cameras this pull serves, set by PullPool.acquire before start(): the first
+        # ffmpeg command is built before any push has subscribed.
+        self.device_ids = set()
         self._lock = threading.Lock()
         self._sinks = {}       # FlvPush -> waiting for a key frame to (re)join
         self._header = None
@@ -662,6 +683,7 @@ class SharedPull:
         self._proc = None
         self._codec_error_logged = None
         self._copy_audio = True  # until ffmpeg says FLV can't hold the camera's audio
+        self._audio_frames = 0   # per attempt: a camera/substream with no audio falls back
         self._last_video = None  # monotonic s of the last video frame of this pull
         self.protect_clock = None  # TRANSCODE video1 with shared decode: a ProtectClock
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -704,23 +726,32 @@ class SharedPull:
                 break
         log.info("pull %s stopped", _describe(self.source_url))
 
+    def _command(self):
+        """(ffmpeg command, whether it keeps the camera's timestamps) for this pull's cameras.
+        The streamName is set per push (set_stream_name), not here."""
+        with self._lock:
+            devices = set(self.device_ids) | {s.device_id for s in self._sinks}
+        camera_ts = use_camera_timestamps(devices)
+        return ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport", self.camera_audio,
+                               self._copy_audio, wallclock=not camera_ts), camera_ts
+
     def _pull_once(self, attempt):
         proc = None
         stderr_tail = lambda: ""
         self._frames = 0
+        self._audio_frames = 0
         self._last_video = None
         codec_error = None
         try:
-            # The streamName is set per push (set_stream_name), not here.
-            cmd = ffmpeg_push_cmd(self.ffmpeg_bin, self.source_url, "diyport",
-                                  self.camera_audio, self._copy_audio)
+            cmd, camera_ts = self._command()
             proc = self._proc = subprocess.Popen(cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             stderr_tail = start_stderr_drain(proc)
             with self._lock:
                 names = ", ".join(sorted(f"{s.device_id}/{s.channel}" for s in self._sinks))
-            log.info("pull %s started for %s (attempt %d, pid %d)",
-                     _describe(self.source_url), names or "no push", attempt, proc.pid)
+            log.info("pull %s started for %s (attempt %d, pid %d%s)",
+                     _describe(self.source_url), names or "no push", attempt, proc.pid,
+                     ", camera timestamps" if camera_ts else "")
             self._consume(proc.stdout.read)
             reason = "ffmpeg output ended"
         except _AudioNotCopyable as exc:
@@ -729,7 +760,7 @@ class SharedPull:
         except UnsupportedCodec as exc:
             codec_error = exc.codec
             reason = str(exc)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, struct.error) as exc:
             reason = repr(exc)
         finally:
             if proc and proc.poll() is None:
@@ -742,6 +773,16 @@ class SharedPull:
                 proc.stdout.close()
             self._end_sinks()
         frames = self._frames
+        if not self._stop.is_set() and self.camera_audio:
+            stderr = stderr_tail()[-500:]
+            if frames > 0 and not self._audio_frames:
+                self.camera_audio = False
+                log.info("pull %s has no audio track: using silent AAC", _describe(self.source_url))
+                return False
+            if frames == 0 and "matches no streams" in stderr:
+                self.camera_audio = False
+                log.info("pull %s has no audio track: using silent AAC", _describe(self.source_url))
+                return False
         if not self._stop.is_set():
             stderr = stderr_tail()[-300:]
             msg = ("pull %s ended after %d frames: %s%s", _describe(self.source_url), frames,
@@ -787,6 +828,8 @@ class SharedPull:
                     (tag_header, body)
             else:
                 self._frames += 1
+                if tag_header[0] == _TAG_AUDIO:
+                    self._audio_frames += 1
                 if tag_header[0] == _TAG_VIDEO:
                     self._last_video = time.monotonic()
                     stats.frame(_tag_timestamp(tag_header))
@@ -814,13 +857,8 @@ class SharedPull:
                     self._sinks[sink] = True  # fell behind: it rejoins at a key frame
 
 
-# AIPORT_ONVIF_SHARED_DECODE=1: detection decodes the video1 FLV this instance pushes to
-# Protect, not its own RTSP pull, and each frame carries the wall time Protect gives it.
-# Live 2026-11-05 16:18 on Driveway (isolated): boxes led the truck by ~1.9 s, because Protect
-# places video by when each frame leaves gst (rtspsrc latency=500, vtdec, vtenc, flvmux,
-# fdsink sync=true) and boxes by when a separate ffmpeg pull handed the detector its frame.
-# Instance-wide; it covers every camera this instance transcodes. On by default since
-# 2026-11-06 (exact boxes at delay 0 on all four onvif cameras); 0 goes back to the camera pull.
+# Shared decode: detection decodes the pushed video1 and uses Protect's wall time, so boxes
+# line up without a separate camera pull. Instance-wide; 0 restores the camera pull.
 SHARED_DECODE = envutil.env_bool("AIPORT_ONVIF_SHARED_DECODE", True)
 DETECT_RECORD = struct.Struct(">BdI")  # kind, wall ms, length; then that many FLV bytes
 DETECT_BYTES, DETECT_FRAME = 0, 1      # kinds: FLV bytes; a video frame (one decoded picture)
@@ -829,14 +867,25 @@ DETECT_QUEUE = 300                     # tags a client may fall behind before it
 
 def detect_socket(source_url):
     """The unix socket serving a camera's video1 to detection, named from its url so avclient
-    and the restream process find the same one without passing it."""
-    digest = hashlib.sha1(source_url.encode()).hexdigest()[:12]
-    return os.path.join(tempfile.gettempdir(), f"diyport-detect-{digest}.sock")
+    and the restream process find the same one without passing it. Each uid gets a private
+    directory (0700): another local user cannot read the video or take the name."""
+    namespace = os.environ.get("AIPORT_DETECT_NAMESPACE", "")
+    digest = hashlib.sha1(f"{namespace}\0{source_url}".encode()).hexdigest()[:12]
+    directory = os.path.join(tempfile.gettempdir(),
+                             f"diyport-detect-{getattr(os, 'getuid', lambda: 0)()}")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    return os.path.join(directory, f"{digest}.sock")
 
 
-# How long detection waits for the video1 push to send a frame before it falls back to its own
-# clock reading (no push connected, or reconnecting).
+# How long detection waits for a video1 frame before using its own clock. After one timeout
+# the clock latches to its own reading, so a missing push cannot throttle detection.
 PROTECT_CLOCK_WAIT_S = 3.0
+PROTECT_CLOCK_STALL_S = 1.0
+PROTECT_CLOCK_RETRY_S = 10.0
 
 
 class ProtectClock:
@@ -855,24 +904,43 @@ class ProtectClock:
         with self._cond:
             self._syncs = collections.deque(maxlen=16)  # (stream ms, wall ms), oldest first
             self._written = None  # stream ms of the last video frame sent to Protect
+            self._last_write = None  # monotonic s of that write
+            # A new stream starts on our own clock until its first push write proves otherwise.
+            self._stalled_until = time.monotonic() + PROTECT_CLOCK_RETRY_S
+            self._cond.notify_all()
 
     def synced(self, stream_ms, wall_ms):
         with self._cond:
             self._syncs.append((stream_ms, wall_ms))
+            self._cond.notify_all()
 
     def wrote(self, stream_ms):
         with self._cond:
             self._written = stream_ms
+            self._last_write = time.monotonic()
+            self._stalled_until = 0.0
             self._cond.notify_all()
 
     def wall(self, stream_ms, timeout):
         """Protect's wall ms for the frame at stream_ms, once the push has sent it, by the
-        sync in force when it went (the latest at or before it); None after `timeout` s."""
-        deadline = time.monotonic() + timeout
+        sync in force when it went (the latest at or before it); None after `timeout` s or
+        immediately while a stalled/absent push has latched the fallback."""
+        now = time.monotonic()
         with self._cond:
+            if now < self._stalled_until:
+                return None
+            if self._written is not None and self._written < stream_ms \
+                    and self._last_write is not None \
+                    and now - self._last_write >= PROTECT_CLOCK_STALL_S:
+                self._stalled_until = now + PROTECT_CLOCK_RETRY_S
+                return None
+            deadline = now + timeout
             while self._written is None or self._written < stream_ms:
+                if time.monotonic() < self._stalled_until:  # reset by another thread
+                    return None
                 left = deadline - time.monotonic()
                 if left <= 0:
+                    self._stalled_until = time.monotonic() + PROTECT_CLOCK_RETRY_S
                     return None
                 self._cond.wait(left)
             sync = next((s for s in reversed(self._syncs) if s[0] <= stream_ms), None)
@@ -888,8 +956,9 @@ class DetectClient:
 
     LAG_LOG_S = 60.0
 
-    def __init__(self, conn, pull):
+    def __init__(self, conn, pull, on_close=None):
         self.conn, self.pull = conn, pull
+        self._on_close = on_close
         clock = getattr(pull, "protect_clock", None)
         self.clock = clock if isinstance(clock, ProtectClock) else None
         self._queue = queue.Queue(DETECT_QUEUE)
@@ -901,6 +970,19 @@ class DetectClient:
         self._lag_logged = time.monotonic()
         pull.subscribe(self)
         threading.Thread(target=self._run, daemon=True, name="detect-client").start()
+
+    def close(self):
+        """Stop this reader even when it is waiting for a frame (server shutdown)."""
+        self.dead = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.conn.close()
 
     def _record(self, kind, data, wall=0.0):
         self._queue.put_nowait(DETECT_RECORD.pack(kind, wall, len(data)) + data)
@@ -984,6 +1066,8 @@ class DetectClient:
             self.dead = True
             self.pull.unsubscribe(self)
             self.conn.close()
+            if self._on_close:
+                self._on_close(self)
 
 
 class DetectServer:
@@ -998,17 +1082,35 @@ class DetectServer:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(path)
         self._sock.listen(2)
+        self._sock.settimeout(1.0)  # so close() can wake _accept
+        self._stop = threading.Event()
+        self._clients = set()
+        self._clients_lock = threading.Lock()
         threading.Thread(target=self._accept, daemon=True, name="detect-accept").start()
 
     def _accept(self):
-        while True:
+        while not self._stop.is_set():
             try:
                 conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
-            DetectClient(conn, self.pull)
+            conn.settimeout(None)  # accept() inherited the listener's 1 s timeout
+            client = DetectClient(conn, self.pull, on_close=self._forget)
+            with self._clients_lock:
+                self._clients.add(client)
+
+    def _forget(self, client):
+        with self._clients_lock:
+            self._clients.discard(client)
 
     def close(self):
+        self._stop.set()
+        with self._clients_lock:
+            clients, self._clients = list(self._clients), set()
+        for client in clients:
+            client.close()
         self._sock.close()
         try:
             os.unlink(self.path)
@@ -1131,6 +1233,7 @@ class TranscodePull:
         ended = threading.Event()
         for out in self.outputs.values():
             out._frames = 0
+            out._audio_frames = 0
             out._last_video = None
             out.reason = "not started"
         try:
@@ -1152,6 +1255,8 @@ class TranscodePull:
             for r, w in pipes.values():
                 os.close(r)
                 os.close(w)
+            for out in self.outputs.values():
+                out._end_sinks()  # no reader was started to do it
             return False
         finally:
             for r, w in pipes.values():
@@ -1185,6 +1290,12 @@ class TranscodePull:
         for out in self.outputs.values():
             out._end_sinks()
         frames = sum(out._frames for out in self.outputs.values())
+        audio_frames = sum(out._audio_frames for out in self.outputs.values())
+        if self.camera_audio and frames > 0 and not audio_frames and not self._stop.is_set():
+            self.camera_audio = False
+            log.warning("transcode %s has no audio track: using silent AAC",
+                        _describe(self.source_url))
+            return False
         if self.camera_audio and frames == 0 and not self._stop.is_set():
             self._gst_audio = (self._gst_audio + 1) % len(GST_AUDIO)
         if not self._stop.is_set():
@@ -1205,14 +1316,18 @@ class PullPool:
         self._lock = threading.Lock()
         self._pulls = {}  # key -> [SharedPull or TranscodePull, users]
 
-    def acquire(self, url, camera_audio, channel=None, renditions=None):
+    def acquire(self, url, camera_audio, channel=None, renditions=None, device_id=None):
         with self._lock:
             key = (url, camera_audio) if renditions is None else (url, camera_audio, renditions)
             entry = self._pulls.get(key)
             if entry is None:
                 pull = (SharedPull(url, camera_audio, self.ffmpeg_bin) if renditions is None
                         else TranscodePull(url, camera_audio, renditions))
+                if device_id and renditions is None:
+                    pull.device_ids.add(device_id)  # before start(): its first command needs it
                 entry = self._pulls[key] = [pull.start(), 0]
+            elif device_id and renditions is None:
+                entry[0].device_ids.add(device_id)
             entry[1] += 1
             return entry[0] if renditions is None else entry[0].outputs[channel]
 
@@ -1252,18 +1367,20 @@ class FlvPush:
         self._pull = None
         self._queue = queue.Queue(maxsize=self.QUEUE_TAGS)
         self._stop = threading.Event()
+        self._reconnect = threading.Event()
         self._sock = None
         self.last_sent = time.monotonic()  # last video frame written to Protect
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"push-{device_id}-{channel}")
 
-    def matches(self, source_url, stream_name, destination, renditions=None):
-        return (self.source_url, self.stream_name, self.destination, self.renditions) == \
+    def matches(self, source_url, stream_name, destination, renditions=None, camera_audio=None):
+        same = (self.source_url, self.stream_name, self.destination, self.renditions) == \
                (source_url, stream_name, destination, renditions)
+        return same and (camera_audio is None or bool(camera_audio) == bool(self.camera_audio))
 
     def start(self):
         self._pull = self._pool.acquire(self.source_url, self.camera_audio, self.channel,
-                                        self.renditions)
+                                        self.renditions, device_id=self.device_id)
         self._pull.subscribe(self)
         self._thread.start()
         return self
@@ -1289,6 +1406,18 @@ class FlvPush:
         owner = getattr(self._pull, "transcode", None)
         if isinstance(owner, TranscodePull):
             owner.restart(reason)
+
+    def reconnect(self, reason):
+        """Open a fresh Protect connection without releasing the shared pull."""
+        log.info("push %s/%s reconnecting: %s", self.device_id, self.channel, reason)
+        self._reconnect.set()
+        self.put(("end", reason))
+        sock = self._sock
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def put(self, item):
         """From the pull: False (and the queue emptied) when this push fell behind."""
@@ -1316,11 +1445,23 @@ class FlvPush:
     def _run(self):
         attempt = failed = 0
         while not self._stop.is_set():
+            if self._reconnect.is_set():
+                self._reconnect.clear()
+                with self._queue.mutex:
+                    self._queue.queue.clear()
+                self._pull.resync(self)
+                continue
             item = self._get(1.0)
             if not item or item[0] != "start":
                 continue  # waiting for the pull to hand over a key frame
             attempt += 1
             failed = 0 if self._push_once(item, attempt) else failed + 1
+            if self._reconnect.is_set():
+                self._reconnect.clear()
+                with self._queue.mutex:
+                    self._queue.queue.clear()
+                self._pull.resync(self)
+                continue
             if self._stop.wait(retry_delay(self.retry_s, failed)):
                 break
             with self._queue.mutex:
@@ -1375,13 +1516,19 @@ class FlvPush:
                     self.last_sent = time.monotonic()
                     if clock:
                         clock.wrote(_tag_timestamp(item[1]))
-        except OSError as exc:
+        except (OSError, ValueError, struct.error) as exc:
             reason = repr(exc)
         finally:
             if self._sock:
+                # The drain thread holds a reference to this socket: close() alone would
+                # not close the fd or send FIN, leaving Protect a second live push.
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 self._sock.close()
                 self._sock = None
-        if not self._stop.is_set():
+        if not self._stop.is_set() and not self._reconnect.is_set():
             log.warning("push %s/%s ended after %d bytes: %s", self.device_id, self.channel,
                         sent, reason)
         return sent > 0
@@ -1398,17 +1545,12 @@ def retry_delay(retry_s, failed):
     return min(PUSH_RETRY_MAX_S, base * 2 ** max(0, failed - 3)) if failed else base
 
 
-# Protect re-sends a channel's ChangeVideoSettings (same streamName) when its media server
-# has lost that stream: it rebuilds its ingest point and waits ~10 s for a fresh connection.
-# Live 2026-10-29: ignoring the repeat left video3 in "Timed out waiting for 80BEAF928356_2
-# to open" every 30 s and the low-quality view stuttering; unifi-cam-proxy reconnects on a
-# repeat. At most one reconnect per channel per RECONNECT_MIN_S, so a burst doesn't churn it.
+# Protect re-sends a channel's settings when its media server lost the stream; reconnect
+# that push, at most once per RECONNECT_MIN_S, instead of ignoring the repeat.
 RECONNECT_MIN_S = 10
 
-# A failed lookup of a camera's ONVIF profiles is tried again, or its video2/video3 stay on the
-# main stream until diy-port restarts. Live 2026-11-04 19:23:39 on Driveway: one "No route to
-# host", the camera reachable 2 s later, and video2 encoded at 2560x1440 instead of 1280x720.
-# First these quick tries, with the channels waiting, so a brief failure changes nothing...
+# Retry a failed ONVIF profile lookup quickly while the SUB channels wait; otherwise a
+# transient error leaves them on the main stream until restart.
 PROFILE_QUICK_RETRY_S = (2.0, 3.0)
 # ...then, with the channels on the main stream, these (the last repeats). Success moves them
 # to the substream at once, replacing the pushes.
@@ -1690,10 +1832,12 @@ class PushManager:
         self._subs = {}      # main url -> substream profile dict, or None (none/failed)
         self._looking_up = set()  # main urls whose profiles are being fetched
 
-    def set_source(self, device_id, url, audio=True, width=None, height=None, fps=None):
+    def set_source(self, device_id, url, audio=True, width=None, height=None, fps=None,
+                   codec=None):
+        note_codec(device_id, codec)
         with self._lock:
             self._sources[device_id] = {"url": url, "audio": bool(audio), "width": width,
-                                        "height": height, "fps": fps}
+                                        "height": height, "fps": fps, "codec": codec}
             lookup = url not in self._subs and url not in self._looking_up
             if lookup:
                 self._looking_up.add(url)
@@ -1767,6 +1911,12 @@ class PushManager:
             src = self._sources.get(device_id)
             sub = self._subs.get(src["url"]) if src else None
             return {k: sub[k] for k in ("width", "height", "fps")} if sub else None
+
+    def substream_pending(self, device_id):
+        """True while this camera's profile lookup is still running."""
+        with self._lock:
+            src = self._sources.get(device_id)
+            return bool(src and src["url"] in self._looking_up)
 
     def transcode_channels(self, device_id):
         """{channel: {width, height, fps, bitrate}} of what each channel is encoded at under
@@ -1886,14 +2036,12 @@ class PushManager:
                 key = (device_id, channel)
                 if key in self._pushes and now - self._reconnected.get(key, -RECONNECT_MIN_S) \
                         >= RECONNECT_MIN_S:
-                    log.info("push %s/%s: Protect re-sent its settings, reconnecting",
-                             device_id, channel)
                     self._reconnected[key] = now
-                    push = self._pushes.pop(key)
+                    push = self._pushes[key]
                     push.restart_source("Protect re-sent its settings")
-                    push.stop()
-                    # Its replacement inherits this, or a channel Protect keeps re-sending
-                    # would look healthy however long it has delivered nothing.
+                    push.reconnect("Protect re-sent its settings")
+                    # Keep its last write, or a channel Protect keeps re-sending would
+                    # look healthy however long it has delivered nothing.
                     self._last_sent[key] = push.last_sent
             self._sync(device_id)
 
@@ -1934,9 +2082,10 @@ class PushManager:
         renditions = self._renditions(device_id, src) if src else None
         rend = lambda channel: renditions if channel in TRANSCODE_CHANNELS else None
         opus_of = self._wanted_opus.get(device_id, {})
-        # Only go pushes take an Opus ask (the ffmpeg modes always make their own Opus).
+        # Only go pushes take an Opus ask (the ffmpeg modes always make their own Opus); the
+        # ffmpeg modes instead restart when the camera's audio comes or goes.
         extra = (lambda channel: {"opus": opus_of.get(channel, (False, 0))}) \
-            if is_go(device_id) else (lambda channel: {})
+            if is_go(device_id) else (lambda channel: {"camera_audio": src.get("audio", True)})
         for key in [k for k in self._pushes if k[0] == device_id]:
             want, url = wanted.get(key[1]), urls.get(key[1])
             if not want or not url or not self._pushes[key].matches(

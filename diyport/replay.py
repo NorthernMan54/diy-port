@@ -226,7 +226,8 @@ def replay(av, frames, settings=None, start_ms=0, settle_s=5.0, startup=False, s
     patches = {
         "time": _ClipTime(),
         "send_msg": lambda ws, fn, payload, **_: (
-            sent.append((now[0], payload)) if fn == "EventSmartDetect" else None),
+            sent.append((av._frame_time(payload.get("deviceID", DEVICE))[1] / 1000.0, payload))
+            if fn == "EventSmartDetect" else None),
         "LEAVE_FALLBACK_S": 10 ** 9,             # no snapshot requests will come
         "_frame_jpeg": lambda *a, **k: None,     # no JPEG pipe offline
         "_BOX_DELAY_DEFAULT_MS": 0,

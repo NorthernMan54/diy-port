@@ -22,16 +22,17 @@ import config
 log = logging.getLogger("aiport-http-api")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CERT_PATH = os.path.join(HERE, "server.crt")
-KEY_PATH = os.path.join(HERE, "server.key")
-ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
+DEFAULT_STATE_DIR = config.default_state_dir()
+CERT_PATH = os.path.join(DEFAULT_STATE_DIR, "server.crt")
+KEY_PATH = os.path.join(DEFAULT_STATE_DIR, "server.key")
+ADOPT_STATE_FILE = os.path.join(DEFAULT_STATE_DIR, "adopt_state.json")
 # Refuse oversized/absent request bodies instead of allocating whatever a peer claims.
 MAX_BODY_BYTES = 1 << 20
 REQUEST_TIMEOUT_S = 10
 # RAM-only dir shared with avclient.py (writes snapshots); served from /api/1.2/snapshot.
 STREAM_DIR = config.stream_dir()
-# --state-dir (or None for the shared diyport/ path); the firmware pin lives here.
-STATE_DIR = None
+# --state-dir overrides this; the firmware pin lives here.
+STATE_DIR = DEFAULT_STATE_DIR
 _STARTED_MONOTONIC = time.monotonic()
 
 
@@ -302,10 +303,9 @@ def main():
     ap.add_argument("--device-id", default=cfg["device_id"])
     ap.add_argument("--guid", default=cfg["guid"])
     ap.add_argument("--state-dir", default=None,
-                     help="where adopt_state.json/server.crt/server.key live -- defaults "
-                          "to this script's own directory (single-instance, unchanged "
-                          "behavior); set this to isolate a second/third AI Port instance "
-                          "running on the same box (see instance_manager.py)")
+                     help="where adopt_state.json/server.crt/server.key live; defaults to "
+                          "$XDG_STATE_HOME/diyport or ~/.local/state/diyport, and isolates "
+                          "a second instance (see instance_manager.py)")
     args = ap.parse_args()
     args.iface = config.resolve_iface(args.iface, cfg)
 
@@ -319,6 +319,8 @@ def main():
         # same --state-dir.
         STREAM_DIR = config.stream_dir(args.state_dir)
         STATE_DIR = args.state_dir
+    else:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
 
     ensure_cert()
 

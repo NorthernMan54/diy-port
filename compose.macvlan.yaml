@@ -3,7 +3,7 @@
 #
 # Dedicated LAN IP/MAC per container (macvlan); static IPs, wired NIC, illustrative only.
 
-name: diyport
+name: diyport-macvlan
 
 services:
   aiport:
@@ -17,6 +17,7 @@ services:
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
+    shm_size: 256m   # per-camera snapshot JPEGs live in /dev/shm
     environment:
       AIPORT_CONSOLE_HOST: "${AIPORT_CONSOLE_HOST:-}"
       AIPORT_CONSOLE_PORT: "${AIPORT_CONSOLE_PORT:-7442}"
@@ -48,3 +49,4 @@ networks:
 
 volumes:
   diyport-data:
+    name: diyport-macvlan-data

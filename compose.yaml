@@ -39,7 +39,8 @@ services:
     # volumes:
     #   - ./diyport/aiport.cfg:/app/diyport/aiport.cfg:ro   # full identity/network surface
 
-  # Optional status page on :8090 (CPU/mem; no auth; GPU/NPU panels are RK3588-only).
+  # Optional status page on :8090 (CPU/mem; no auth; loopback by default). For LAN
+  # access change --bind-ip to 0.0.0.0; GPU/NPU panels are RK3588-only.
   webui:
     image: diyport-cpu
     build:
@@ -51,7 +52,7 @@ services:
     network_mode: host
     restart: unless-stopped
     entrypoint: ["python3", "diyport/sysinfo_server.py"]
-    command: ["--bind-ip", "0.0.0.0", "--port", "8090"]
+    command: ["--bind-ip", "127.0.0.1", "--port", "8090"]
 
 volumes:
   diyport-data:

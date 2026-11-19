@@ -10,6 +10,11 @@ x86_64) with a detector backend baked in at build time:
 | `openvino` | Intel iGPU/Arc/NPU (`openvino` + Intel compute runtime) | amd64 only; YOLOv5n; needs `--device /dev/dri`; see [Intel GPU / NPU](#intel-gpu--npu-openvino) |
 | `none` | detection off | Protocol stack only |
 
+`--build-arg FACES=1` adds face detection and recognition to any of these:
+OpenCV plus the sha256-pinned YuNet/SFace models (`diyport/enrich.py`). Faces
+are matched against Protect's known-faces DB, which Protect pushes to the
+device. The default (`FACES=0`) leaves both out, and the stage stays off.
+
 The RK3588 NPU backend is not offered in the image - use `scripts/install.sh`
 on that board. Coral device passthrough is wired into the bridge stack
 (`docker/docker-compose.yml`) only; the host/macvlan stacks are CPU-only unless
@@ -28,9 +33,9 @@ There are two deployment shapes, for two different console locations:
 ```bash
 # from the repo root
 docker build -f docker/Dockerfile -t diyport-cpu .
-docker run --rm --network host --cap-add NET_ADMIN \
+docker run --rm --network host --cap-add NET_ADMIN --shm-size 256m \
     -v diyport-data:/data \
-    -e AIPORT_CONSOLE_HOST=<console-ip> diyport-cpu
+    -e AIPORT_CONSOLE_HOST=<console-ip> diyport-cpu --state-dir /data
 ```
 
 Or the Compose stack:
@@ -69,6 +74,16 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+The supported setup is a console with host networking (`network_mode: host`),
+which sees the host's bridge interfaces. A macvlan console cannot reach
+`172.30.10.10`, and a console on a bridge of its own does not scan this one
+(put both containers on the same Docker network if you need that). Protect's
+discovery scan also ignores Docker's normal `br-<hash>` interface names: the
+stack names the host bridge `${AIPORT_BRIDGE_NAME:-br1}`, which matches the
+`br<N>` names Protect scans. Pick another free `br<N>` if `br1` is taken.
+Protect scans once a minute, so allow up to a minute for the AI Port to appear
+after `docker compose up`.
+
 Then adopt "AI Port" in Protect and pair a UniFi camera to it. Verified on a
 Raspberry Pi 5 (Pi OS trixie) with a USB Coral, next to the UNVR container:
 discovery, adoption, restart, a UniFi camera via Protect's relay, and a
@@ -82,6 +97,7 @@ Hikvision 4K ONVIF camera (video push, live view, recording, detection).
 | `AIPORT_DETECTOR` | image `ACCEL` | Container env: detector backend override (`cpu`/`edgetpu`/`openvino`/`none`) |
 | `AIPORT_ACCEL` | `edgetpu` | Compose build arg: detector baked into the image |
 | `AIPORT_IP` / `AIPORT_SUBNET` | `172.30.10.10` / `172.30.10.0/24` | Compose interpolation: container address/subnet; keep the IP fixed, the console stores it |
+| `AIPORT_BRIDGE_NAME` | `br1` | Host bridge name; must be a free `br<N>` for Protect's discovery scan |
 
 The trade-off: the AI Port lives on the Docker subnet, so only that host can
 reach it. A console on another machine cannot - use `scripts/install.sh` or the
@@ -110,7 +126,14 @@ a LAN address, and UBNT discovery broadcasts don't reach it. Use `compose.macos.
    # remove: sudo pfctl -a com.apple/diyport-docker -F all
    ```
 
-   Neither rule survives a reboot.
+   Neither rule survives a reboot. After a reboot (or before `up`), check both:
+
+   ```bash
+   sudo AIPORT_ADVERTISE_IP=192.0.2.39 AIPORT_IFACE=en0 \
+     scripts/macos_docker_preflight.sh
+   ```
+
+   It exits nonzero and prints the alias or pf command when either is missing.
 
 3. Start it with the address it should report:
 
@@ -126,11 +149,11 @@ in Protect before deleting it.
 
 ## Status web UI (optional)
 
-The repo-root `compose.yaml` includes a `webui` service that runs
-`sysinfo_server.py` on `:8090` (`http://<host>:8090`): CPU per-core, memory,
-GPU/NPU when present, and the Coral's USB link speed. It has **no auth** - LAN
-use only. Instance create/destroy is localhost-only by default (set
-`AIPORT_WEBUI_ALLOW_REMOTE=1` in the service to allow it from the LAN). The
+The repo-root `compose.yaml` includes an optional `webui` service that runs
+`sysinfo_server.py` on `127.0.0.1:8090` by default: CPU per-core, memory,
+GPU/NPU when present, and the Coral's USB link speed. It has **no auth**. To
+reach it from the LAN, change its `--bind-ip` to `0.0.0.0` and set
+`AIPORT_WEBUI_ALLOW_REMOTE=1` if you also want instance create/destroy. The
 instance buttons are `instance_manager` (board) features; ignore them off-board.
 Remove the `webui` service if you do not want it. The bridge stack does not
 include the web UI.
@@ -195,6 +218,11 @@ Requirements and caveats:
   interface on the host (the console on the LAN can).
 - Give every instance a unique IP, MAC and `AIPORT_DEVICE_ID`, or the console
   sees one device instead of several.
+- The macvlan stack uses the `diyport-macvlan-data` volume, separate from the
+  host-net stack's `diyport_diyport-data`. Do not point both topologies at one
+  volume: the same adoption state with a different MAC is a different Protect
+  device. To migrate an old macvlan instance that used the shared volume, copy
+  it once with `docker run --rm -v diyport_diyport-data:/from -v diyport-macvlan-data:/to alpine sh -c 'cp -a /from/. /to/'`.
 
 Both modes require the target host to be on the console's LAN. Choose host mode
 for a quick single-instance test, macvlan when the host already uses `:443` or
@@ -239,10 +267,11 @@ The bridge stack keeps everything persistent in the `aiport-data` volume
   image rebuilds.
 
 `docker compose down -v` deletes the volume, i.e. the device identity. Remove the
-AI Port in Protect first. The LAN stacks mount the same `diyport-data` volume at
-`/data` and pass `--state-dir /data`, so adoption and identity also survive
-`up -d --build`; set `AIPORT_DEVICE_ID` / `AIPORT_MAC` explicitly if you need a
-fixed identity without the entrypoint wrapper.
+AI Port in Protect first. The host-net stack uses `diyport_diyport-data` and
+macvlan uses `diyport-macvlan-data`, both mounted at `/data` with
+`--state-dir /data`, so adoption and identity survive `up -d --build`; set
+`AIPORT_DEVICE_ID` / `AIPORT_MAC` explicitly if you need a fixed identity
+without the entrypoint wrapper.
 
 ## Coral
 
@@ -297,7 +326,8 @@ container on host networking:
   firmware push pinned to 5.1.16 (fake update), four cameras paired, RTSP pulls
   running, the onnxruntime detector emitting a real `EventSmartDetect`
   (`person`, `edgeType: enter`) and a snapshot upload.
-- Status web UI (`sysinfo_server.py` on `:8090`) serves on the Pi (GPU/NPU blank).
+- Status web UI (`sysinfo_server.py` on `127.0.0.1:8090` by default) serves on the Pi
+  (GPU/NPU blank).
 
 Confirmed on a Raspberry Pi 5 (Pi OS trixie) with a USB Coral, bridge stack next
 to the UNVR container:

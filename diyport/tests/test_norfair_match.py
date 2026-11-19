@@ -9,7 +9,15 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import norfair_match as nm  # noqa: E402
+try:
+    import norfair  # noqa: F401
+    _HAVE_NORFAIR = True
+except ImportError:
+    _HAVE_NORFAIR = False
+if _HAVE_NORFAIR:
+    import norfair_match as nm  # noqa: E402
+else:
+    nm = None
 
 
 def numpy_distance(detection, estimate):
@@ -35,6 +43,7 @@ def box(x, y, w, h):
     return np.array([[x, y], [x + w, y + h]], dtype=float)
 
 
+@unittest.skipUnless(_HAVE_NORFAIR, "norfair is not installed (optional)")
 class TestDistance(unittest.TestCase):
     def test_matches_frigates_numpy_distance(self):
         # Live 2026-11-11: the numpy version was ~74% of avclient's GIL time.

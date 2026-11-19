@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -324,16 +325,26 @@ def netmask_to_prefix(netmask):
 
 def atomic_write_json(path, obj):
     """Write obj as JSON atomically (tmp + os.replace) so readers never see a torn write."""
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(obj, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _tmpfs_base():
@@ -412,20 +423,52 @@ def make_stream_dir(path):
     parent = os.path.dirname(path)
     try:
         os.mkdir(parent)
-        os.chmod(parent, 0o1777)
     except FileExistsError:
         pass
+    try:
+        # Also fix a parent left 0755 by an older version or another instance.
+        os.chmod(parent, 0o1777)
+    except OSError:
+        pass
     os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def default_state_dir():
+    """Per-user runtime state outside the repo: $XDG_STATE_HOME/diyport or ~/.local/state/diyport."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(os.path.abspath(base), "diyport")
+
+
+_LEGACY_STATE_FILES = ("adopt_state.json", "server.crt", "server.key",
+                       "fw_version.json", "device_name")
+
+
+def migrate_repo_state(dest):
+    """Copy legacy repo-local state into `dest` once; returns the copied names."""
+    dest = os.path.abspath(dest)
+    if dest == os.path.abspath(HERE):
+        return []
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    copied = []
+    for name in _LEGACY_STATE_FILES:
+        src, dst = os.path.join(HERE, name), os.path.join(dest, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+            copied.append(name)
+    return copied
 
 
 def pinned_fw_version(state_dir=None):
     """Firmware version pinned by a simulated UpdateFirmwareRequest, or None.
 
     avclient.py writes ``fw_version.json`` here on the update (ack + fake reboot,
-    no flash); every stage must pass the same ``--state-dir`` to read it. Without
-    one, all stages share the diyport/ directory.
+    no flash); every stage must pass the same ``--state-dir`` to read it.
     """
-    path = os.path.join(state_dir or HERE, "fw_version.json")
+    path = os.path.join(state_dir or default_state_dir(), "fw_version.json")
     try:
         with open(path) as f:
             version = json.load(f).get("version")
@@ -441,7 +484,7 @@ def effective_fw_version(configured, state_dir=None):
 
 def pin_fw_version(state_dir, version):
     """Persist the version a simulated UpdateFirmwareRequest 'installed'."""
-    atomic_write_json(os.path.join(state_dir or HERE, "fw_version.json"),
+    atomic_write_json(os.path.join(state_dir or default_state_dir(), "fw_version.json"),
                       {"version": version})
 
 
@@ -450,7 +493,7 @@ def device_name(state_dir=None, default=None):
     default. Protect pushes the user's rename via ChangeDeviceSettings; persisting
     it here lets the discovery responder report the same name Network shows."""
     try:
-        with open(os.path.join(state_dir or HERE, "device_name")) as f:
+        with open(os.path.join(state_dir or default_state_dir(), "device_name")) as f:
             name = f.read().strip()
         return name or (default or DEFAULTS["name"])
     except OSError:
@@ -458,7 +501,7 @@ def device_name(state_dir=None, default=None):
 
 
 def set_device_name(state_dir, name):
-    path = os.path.join(state_dir or HERE, "device_name")
+    path = os.path.join(state_dir or default_state_dir(), "device_name")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(name)

@@ -6,7 +6,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC2034  # read by diyport_paths.sh
 USER_HOME="$(eval echo "~${SUDO_USER:-$USER}")"
+# shellcheck disable=SC1091  # resolved at runtime from the script's own directory
 . "$(dirname "$0")/diyport_paths.sh"   # DIYPORT_INSTANCE picks the instance; "native" if not set
 STATE_DIR="${DIYPORT_STATE_DIR:-$DEFAULT_STATE_DIR}"
 

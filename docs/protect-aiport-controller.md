@@ -232,19 +232,24 @@ at the console's own `/internal/update/...` copy of the same file.
 
 Ranked by impact. Each was checked against both codebases.
 
-1. **The LPR-flag message wipes zones and lines.** On every AI Port connect, step 7
+1. ~~**The LPR-flag message wipes zones and lines.**~~ Fixed: `ChangeSmartDetectSettings`
+   now keeps the keys a partial update omits. Original finding: On every AI Port connect, step 7
    above sends `ChangeSmartDetectSettings {isLprCamera, deviceID}`. diy-port's handler
    (`avclient.py` `handle_function`) replaces `excludeZones`, `zones` and `lines` with
    whatever the payload has, which is nothing. So after a reconnect, exclude zones
    stop filtering, detect zones stop restricting, and Line Crossing stops, until
    Protect happens to resend the full settings. Fix: only update keys that are present.
 
-2. **No motion events for paired cameras.** Protect drops a paired camera's own
-   `EventSmartMotion`/`EventAnalytics`, and diy-port never sends them. Motion-only
-   events and motion-triggered recording for paired cameras likely stop. diy-port needs
-   to send `EventSmartMotion` (`eventType: "motion"`, `edgeType: start|stop`, or
-   `eventType: "pulse"`) with `deviceID`. The exact payload fields still need to be
-   read from the `events.cameras.motionStart` handler.
+2. ~~**No motion events for paired cameras.**~~ Fixed: `ChangeSmartMotionSettings`
+   stores `enable`, both linger times and `eventMaxDurationMSec`; the existing
+   per-frame motion gate now sends `EventSmartMotion` `start`/`stop` with `deviceID`
+   and Protect 7.3.70's full `motionMessage` fields. The event opens once motion
+   persists for `lingerEventStartMSec`, closes `lingerEventStopMSec` after the last
+   motion, and is split at `eventMaxDurationMSec`. Pulses and the heatmap are not
+   sent, so Protect records motion events without the UI's heatmap overlay. Original
+   finding: Protect drops a paired camera's own `EventSmartMotion`/`EventAnalytics`,
+   and diy-port never sent them, so motion-only events and motion-triggered recording
+   stopped.
 
 3. **Camera audio detections are lost.** The same rule drops the camera's own
    `EventSmartAudio`, and diy-port's feature flags have no audio types, so the camera's
@@ -259,7 +264,9 @@ Ranked by impact. Each was checked against both codebases.
    devices, but it also picks the adopt path (`/api/adopt` vs `/api/1.2/manage`), so
    re-test adoption.
 
-5. **Third-party (ONVIF) cameras pair but get no detection and likely no video.**
+5. ~~**Third-party (ONVIF) cameras pair but get no detection and likely no video.**~~
+   Fixed: diy-port pulls `streamUrl`, pushes video1-3 and audio to Protect, and runs
+   detection on it (`onvif_push.py`, `docs/onvif-modes.md`). Original finding:
    diy-port replies `started` to `OnvifStreamControl` without pulling `streamUrl`.
    Protect has stopped ingesting that camera directly and expects the AI Port to push
    its video, so the camera probably stops recording as well as getting no detections.

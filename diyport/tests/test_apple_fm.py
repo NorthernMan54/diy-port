@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,6 +27,7 @@ class TestHelperStop(unittest.TestCase):
 
     def _classifier(self, script):
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
         binary = os.path.join(d, "helper")
         with open(binary, "w") as f:
             f.write("#!/bin/sh\n" + script)

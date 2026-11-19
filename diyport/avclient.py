@@ -57,9 +57,10 @@ import regions
 from procutil import start_stderr_drain
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
-CERT_PATH = os.path.join(HERE, "server.crt")
-KEY_PATH = os.path.join(HERE, "server.key")
+DEFAULT_STATE_DIR = config.default_state_dir()
+ADOPT_STATE_FILE = os.path.join(DEFAULT_STATE_DIR, "adopt_state.json")
+CERT_PATH = os.path.join(DEFAULT_STATE_DIR, "server.crt")
+KEY_PATH = os.path.join(DEFAULT_STATE_DIR, "server.key")
 _PROCESS_START_MS = int(time.time() * 1000)
 
 _msg_id_counter = itertools.count(1)
@@ -68,8 +69,8 @@ _msg_id_counter = itertools.count(1)
 _active_streams = {}
 # tmpfs dir ffmpeg writes each camera's snapshot JPEG into (never persistent).
 _STREAM_DIR = config.stream_dir()
-# --state-dir (or None for the shared diyport/ path); the firmware pin lives here.
-STATE_DIR = None
+# --state-dir overrides this; the firmware pin and face DB live here.
+STATE_DIR = DEFAULT_STATE_DIR
 # deviceID -> consecutive unexpected-death count since the last UiStreamControl start.
 _stream_restart_count = {}
 STREAM_RETRY_MAX_S = 30.0   # longest wait between pulls of a source that keeps failing
@@ -88,9 +89,7 @@ _HWDEC_BACKENDS = {
     "v4l2m2m": {"h264": ["-c:v", "h264_v4l2m2m"], "hevc": ["-c:v", "hevc_v4l2m2m"]},
     "videotoolbox": {"hevc": ["-hwaccel", "videotoolbox"]},
 }
-# Codecs hardware-decoded only when pulled straight from the camera (an ONVIF camera), not
-# through Protect's relay. A 2560x1440 Hikvision's H.264 (driveway clips, 2026-10-28) decoded
-# with 0 errors either way, VideoToolbox at ~1.4% of a core vs ~7.3% in software.
+# These codecs are hardware-decoded only on a direct ONVIF pull, never through the relay.
 _HWDEC_DIRECT = {
     "videotoolbox": {"h264": ["-hwaccel", "videotoolbox"]},
 }
@@ -475,6 +474,9 @@ def build_ssl_context():
     return ctx
 
 
+_send_lock = threading.Lock()
+
+
 def send_msg(ws, functionName, payload, to="ubnt_avclient", in_response_to=None,
              response_expected=False, from_="UniFiVideo"):
     msg = {
@@ -491,7 +493,8 @@ def send_msg(ws, functionName, payload, to="ubnt_avclient", in_response_to=None,
         "inResponseTo": in_response_to if in_response_to is not None else 0,
     }
     # Controller sends/expects plain JSON as BINARY frames (opcode 0x2), not text.
-    ws.send(json.dumps(msg).encode())
+    with _send_lock:
+        ws.send(json.dumps(msg).encode())
     log.info(">>> sent %s (id=%s) payload=%s", functionName, msg["messageId"], payload)
 
 
@@ -587,7 +590,11 @@ def _tmp_dir():
     use: macOS's periodic /tmp cleanup can remove it while diy-port runs."""
     config.make_stream_dir(_STREAM_DIR)
     path = os.path.join(_STREAM_DIR, "tmp")
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
     return path
 
 
@@ -595,7 +602,7 @@ def _write_snapshot(path, data):
     """Replace the camera's snapshot file in one step, so a reader never sees half of it."""
     fd, tmp = tempfile.mkstemp(suffix=".jpg", dir=_tmp_dir())
     try:
-        os.fchmod(fd, 0o644)  # mkstemp's 0600; ffmpeg wrote the snapshot world-readable
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
@@ -732,6 +739,8 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     ONVIF camera's own RTSP URL."""
     direct = bool(url)
     url = url or f"rtsp://{ip}:{port}/{uri}"
+    if direct:
+        onvif_push.validate_stream_url(url)
     source = (str(ip), str(port), str(uri), url, width, height)
     proc = _active_streams.get(device_id)
     if proc is not None and proc.poll() is None and _stream_source.get(device_id) == source:
@@ -743,6 +752,8 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     out_path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
     probe = _probe_stream(url)
     _stream_probe[device_id] = probe
+    if direct:
+        onvif_push.note_codec(device_id, probe.get("codec"))
     shared = _shared_decode_source(device_id, url) if direct else None
     (_shared_decoding.add if shared else _shared_decoding.discard)(device_id)
     if probe["width"] and probe["height"]:
@@ -766,6 +777,7 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
     jpeg_r, jpeg_w = os.pipe()
     cmd = [
         FFMPEG_BIN, "-loglevel", "warning", *(input_args or [
+            "-protocol_whitelist", "rtsp,tcp,udp,rtp,tls",
             "-rtsp_transport", "tcp", *_rtsp_timeout_args(),
             # Low-latency decode (no B-frame reorder delay). Not "-fflags nobuffer": with this
             # split/fps pipeline it left the rawvideo detection output empty (ffmpeg 8).
@@ -834,7 +846,7 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None, url=None):
                 if shared:
                     try:  # the wall time Protect places this frame at
                         wall = walls.popleft()
-                        stamp = (int(wall), stamp[1] - (stamp[0] - int(wall)))
+                        stamp = _shared_stamp(stamp, wall)
                     except IndexError:
                         log.warning("shared decode for deviceID=%s: frame without a time",
                                     device_id)
@@ -1270,9 +1282,9 @@ def _faces_dirs():
 
 
 def _open_dir(path):
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
     try:
-        os.chmod(path, 0o777)
+        os.chmod(path, 0o700)
     except OSError:
         pass
 
@@ -1306,7 +1318,7 @@ def _save_face_crop(device_id, tracker_id, tr):
         path = os.path.join(seen_dir, f"{stamp}_{device_id}_t{tracker_id}_{best['score']:.2f}.jpg")
         with open(path, "wb") as f:
             f.write(jpg.tobytes())
-        os.chmod(path, 0o666)
+        os.chmod(path, 0o600)
         names = sorted(n for n in os.listdir(seen_dir) if n.endswith(".jpg"))
         for old in names[:-FACES_SEEN_MAX]:
             os.remove(os.path.join(seen_dir, old))
@@ -1536,6 +1548,7 @@ def _request_fm(device_id, tr):
     tr["fm_sent"] = tr.get("fm_sent", 0) + 1
     tr["fm_last_ms"] = now
     tr["fm_pending"] = tr.get("fm_pending", 0) + 1
+    tr["fm_hold_ms"] = now
     job = (device_id, tr, best["jpeg"], list(best["coord"]))
     if VEHICLE_FM_SYNC:
         _fm_job(*job, locked=True)
@@ -1555,6 +1568,7 @@ def _fm_hold(tr, now_ms):
     """True while a vehicle track that would close waits for a pending model answer, up to
     VEHICLE_FM_HOLD_MS: live 16:11 a bus's "bus yellow" arrived 2 s after its leave."""
     if not tr.get("fm_pending"):
+        tr.pop("fm_hold_ms", None)
         return False
     return now_ms - tr.setdefault("fm_hold_ms", now_ms) < VEHICLE_FM_HOLD_MS
 
@@ -1613,11 +1627,8 @@ def _plate_settled(device_id, coord):
     return False
 
 
-# Plate/face reads come from the analysed frame's own JPEG (the one its person and vehicle
-# boxes came from), at most every AIPORT_ENRICH_INTERVAL_S; between reads a face box moves
-# with its person. Live 2026-11-06 on the onvif instance: face boxes were sluggish next to
-# exact person boxes, because reads came from the 1 s snapshot file and each result was
-# re-sent with every newer frame's time until the next snapshot.
+# Plate/face reads use the analysed frame JPEG, at most every AIPORT_ENRICH_INTERVAL_S;
+# a face box follows its person between reads.
 ENRICH_INTERVAL_S = envutil.env_float("AIPORT_ENRICH_INTERVAL_S", 0.25)
 _enrich_last_read = {}  # deviceID -> monotonic s of the last fresh plate/face read
 
@@ -2087,16 +2098,8 @@ def _dedupe_detections(detections, iou_thresh=0.4):
     return out
 
 
-# One object, two labels: per-class NMS keeps a person box and an animal box drawn on the same
-# person. Live 19:02 on Driveway a person walking up the drive was also "animal" on a few
-# frames (box IoU ~0.6 with the person's), confirmed and joined the event as an animal. An
-# animal box over a person box in the same frame, or over a person track seen within
-# CROSS_TYPE_RECENT_MS, is taken as that person, so the person's track keeps its frames.
-# Person always wins: letting the higher score or an existing animal track decide, the 13:33
-# Driveway replay (two people crossing) boxed the second person as an animal at 0.9, and every
-# person box after that went to the animal track. A dog beside its walker is a far smaller
-# box, so overlaps far less. Vehicles stay out: a rider on a motorcycle can overlap it this
-# much and both count. AIPORT_CROSS_TYPE_IOU sets the overlap; 0 turns this off.
+# An animal box over a person is that person. Person wins over a higher-scoring animal
+# track; vehicles stay separate. AIPORT_CROSS_TYPE_IOU controls the overlap.
 CROSS_TYPE_IOU = envutil.env_float("AIPORT_CROSS_TYPE_IOU", 0.5)
 CROSS_TYPE_RECENT_MS = 1000
 # A person *track* claims an animal box only once confirmed or scoring at least this. Live
@@ -2137,8 +2140,18 @@ def _animal_on_person(tracks, detections, now_ms, device_id=None):
 
 _scene_ref = {}  # deviceID -> (downsampled grayscale reference frame, monotonic ms taken)
 _motion_detectors = {}  # deviceID -> motion.MotionDetector (rebuilt when settings change)
-_motion_settings = {}   # deviceID -> {"level", "zones"} from ChangeSmartMotionSettings
+# deviceID -> {"level", "zones", "enable", "start_ms", "stop_ms", "max_ms"} from
+# ChangeSmartMotionSettings. enable stays False until Protect asks for motion events.
+_motion_settings = {}
 _motion_boxes = {}      # deviceID -> this frame's motion boxes (detector-frame pixels)
+# Motion events (the real ubnt_smart_motion): Protect ignores a paired camera's own
+# EventSmartMotion, so the AI Port must send it. Defaults match
+# smartmotion-default-response.json; event_id starts at 0 and is never reused per stream.
+MOTION_EVENT_DEFAULT_START_MS = 1000
+MOTION_EVENT_DEFAULT_STOP_MS = 3000
+MOTION_EVENT_DEFAULT_MAX_MS = 300000
+# deviceID -> {"active", "event_id", "since_ms", "started_ms", "last_motion_ms"}
+_motion_events = {}
 
 
 def _canvas_to_image(device_id, x, y):
@@ -2237,16 +2250,11 @@ STILL_IOU = 0.7
 STILL_TICKS = _ticks(30)
 STARTUP_WINDOW_MS = 15000
 PARK_WHEN_STILL = ("vehicle",)
-# Once confirmed, a still person or animal parks too, so someone standing in the driveway
-# doesn't hold the camera's one event open to its time limit and pull later passers-by into
-# it. A real camera does the same: a stationary tracker is a bystander, carried in the
-# descriptors but not holding the event (unifi-cam-proxy's EventSmartDetect captures). Their
-# face parks with them. Unlike a vehicle, a person who never moved still opens an event.
+# A confirmed still person/animal parks too, so a bystander does not hold the camera's one
+# event open; their face parks with them. A person who never moved still opens an event.
 PARK_WHEN_STILL_IN_EVENT = PARK_WHEN_STILL + ("person", "animal")
-# People standing and talking shift and gesture, so their box rarely keeps STILL_IOU with its
-# anchor for STILL_TICKS (live 10:42: three people stood ~1 minute, longest IoU run 36 s).
-# For them, still is the box centre staying within RESUME_MOVE_FRACTION of the anchor box's
-# size for STILL_PERSON_MS of frame time, which doesn't stretch when detection falls behind.
+# People shift and gesture, so still means the box centre stays within RESUME_MOVE_FRACTION
+# for STILL_PERSON_MS, not the STILL_IOU tick count.
 STILL_BY_CENTRE = ("person", "animal")
 STILL_PERSON_MS = 20000
 
@@ -2284,6 +2292,12 @@ def _resume_recent(dev, d, event):
     for i, (tid, tr, _closed_ms) in enumerate(dev.get("recent", ())):
         if tr["objectType"] != d["objectType"]:
             continue
+        if tr["objectType"] == "face" and tr.get("stationary_coord"):
+            # A parked face at the same spot is not the same person by geometry alone.
+            emb = ((d.get("scored") or {}).get("faceEmbed") or (None,))[0]
+            sim = _face_similarity(emb, (tr.get("extra") or {}).get("faceEmbed"))
+            if sim is None or sim < FACE_RESUME_MIN_SIM:
+                continue
         iou = max(_iou(tr["coord"], d["coord"]), _iou(tr.get("first_coord") or tr["coord"], d["coord"]))
         if iou < best_iou:
             continue
@@ -2305,12 +2319,10 @@ def _resume_recent(dev, d, event):
     return tid, tr, how
 
 
-# A face that turns up again in an open event continues the nearest face track that closed in
-# that event, wherever its person went: each face track is a face in Protect's list, and live
-# 15:44 on Driveway two people loading bikes, ducking behind a car, made 10 face tracks. A face
-# the embeddings show to be someone else (similarity under FACE_RESUME_MIN_SIM) starts its own,
-# and a named face is continued only by a read whose embedding shows the same person.
+# A face returning in an open event continues its nearest closed face track only when the
+# embedding matches; a different or named face starts its own.
 FACE_RESUME_MIN_SIM = 0.3
+FACE_RESUME_MAX_DIST_FACTOR = 2.0  # old face size, when the new read has no embedding
 
 
 def _face_similarity(a, b):
@@ -2326,6 +2338,35 @@ def _person_moving(tracks, face):
     """Whether a face track's person is tracked and not parked."""
     person = tracks.get(face.get("person_tid"))
     return person is not None and not person.get("stationary_coord")
+
+
+def _parent_track(tracks, tr):
+    """The track that owns this face/plate, by its own link or the box that contains it."""
+    if tr["objectType"] == "face":
+        return tracks.get(tr.get("person_tid"))
+    if tr["objectType"] != "licensePlate":
+        return None
+    x, y, w, h = tr["coord"]
+    cx, cy = x + w / 2, y + h / 2
+    found, best = None, None
+    for p in tracks.values():
+        if p["objectType"] != "vehicle" or not p.get("confirmed", True) \
+                or p.get("stationary_coord"):
+            continue
+        px, py, pw, ph = p["coord"]
+        if not (px <= cx <= px + pw and py <= cy <= py + ph):
+            continue
+        dist = abs(cx - (px + pw / 2)) + abs(cy - (py + ph / 2))
+        if best is None or dist < best:
+            found, best = p, dist
+    return found
+
+
+def _parent_moving(tracks, tr):
+    """Whether the parent that owns this face/plate is confirmed and moving."""
+    parent = _parent_track(tracks, tr)
+    return (parent is not None and parent.get("confirmed", True)
+            and not parent.get("stationary_coord"))
 
 
 def _event_face(dev, d, event):
@@ -2346,6 +2387,8 @@ def _event_face(dev, d, event):
             continue  # a named face takes only a read shown to be the same person
         x, y, w, h = tr["coord"]
         dist = math.hypot(x + w / 2 - cx, y + h / 2 - cy)
+        if sim is None and dist > max(w, h) * FACE_RESUME_MAX_DIST_FACTOR:
+            continue
         if best_dist is None or dist < best_dist:
             best, best_dist = (i, tid, tr, "event"), dist
     return best
@@ -2464,11 +2507,8 @@ LEAVE_PRIORITY = {"face": 0, "person": 1, "vehicle": 2, "animal": 3}
 # A multi-participant leave: empty descriptors, one snapshot each, attributes in
 # trackerIDAttrMap; falls back to the single-tracker leave after LEAVE_FALLBACK_S.
 LEAVE_FALLBACK_S = 4.0
-# Each participant's final descriptor (best-frame box and score) also goes in that leave:
-# with empty descriptors Protect showed every multi-participant event at 30% (live
-# 2026-10-29: a person sent at 51 and a vehicle at 68 both showed 30%), while
-# single-participant leaves, which carry a descriptor, showed their real score.
-# AIPORT_MULTI_LEAVE_DESCRIPTORS=0 goes back to empty descriptors.
+# The leave carries each participant's final descriptor, or Protect shows every
+# multi-participant event at 30%; AIPORT_MULTI_LEAVE_DESCRIPTORS=0 disables this.
 MULTI_LEAVE_DESCRIPTORS = envutil.env_bool("AIPORT_MULTI_LEAVE_DESCRIPTORS", True)
 _pending_leaves = {}  # snapshot filename -> shared {"seen": bool} for a multi-tracker leave
 
@@ -2717,7 +2757,12 @@ def _send_multi_leave(ws, device_id, event_id, members, fallback):
         except Exception:
             log.exception("single-tracker fallback leave failed for event %s", event_id)
 
-    send_msg(ws, "EventSmartDetect", payload, response_expected=False)
+    try:
+        send_msg(ws, "EventSmartDetect", payload, response_expected=False)
+    except Exception:
+        for n in names:
+            _pending_leaves.pop(n, None)
+        raise
     timer = threading.Timer(LEAVE_FALLBACK_S, _check)
     timer.daemon = True
     timer.start()
@@ -2957,6 +3002,7 @@ def _motion_tick(ws, device_id):
         if device_id in _latest_frame_time:
             _analysed_frame_time[device_id] = _latest_frame_time[device_id]
     changed = _scene_changed(device_id)
+    _update_motion_event(ws, device_id, changed)
     # The startup look runs on a still scene too: live 17:05 Camera A saw no motion for
     # 27 s at dusk, so its parked cars were first detected after the window and opened an event.
     in_startup = started is None or _frame_wall_ms(device_id) - started <= STARTUP_WINDOW_MS
@@ -2992,11 +3038,8 @@ def _motion_tick(ws, device_id):
         joining = []  # tracks that start (or resume) taking part in the event this tick
         detections = _animal_on_person(tracks, detections, now_ms, device_id)
         unclaimed = list(range(len(detections)))
-        # Zones decide what's reported, not what's tracked (as Frigate): every detection is
-        # tracked; a track joins the event only once its feet have been in a zone listing its
-        # type, and stays in it until it's gone. Live 11:38 on Camera B a walk to the front door
-        # crossed a gap between zones; dropping the detections there starved the person's track,
-        # named Alex, and it never made the event.
+        # Zones decide what is reported, not what is tracked. A track joins once it has been in
+        # a zone listing its type and stays until gone.
         for d in detections:
             if "in_zone" not in d:
                 d["zone_ids"] = _zones_of(device_id, d["coord"], d["objectType"])
@@ -3044,14 +3087,15 @@ def _motion_tick(ws, device_id):
                         tr["coord"] = list(tr["stationary_coord"])
                         tr["moved_ticks"] = 0
                     elif tr["objectType"] == "face" and not _person_moving(tracks, tr):
-                        # A face moves with its person. Live 15:43 on Driveway faces parked
-                        # since 12:36 and 12:39 took a passing face at their spot and rejoined
-                        # as faces of their own: the parked face goes, and the read starts or
-                        # resumes a track like any other.
+                        # A face moves with its person. A parked face that moves while its person is still is
+                        # dropped; the read at its spot starts or resumes a track like any other.
                         log.info("real motion tick: parked face tracker_id=%s dropped, its "
                                  "person isn't moving; the face at its spot is someone else's "
                                  "for deviceID=%s", tracker_id, device_id)
                         unclaimed.append(matches.pop(tracker_id))
+                        if event is not None:
+                            event["finished"] = [m for m in event["finished"]
+                                                 if m[0] != tracker_id]
                         del tracks[tracker_id]
                         continue
                     else:
@@ -3109,9 +3153,8 @@ def _motion_tick(ws, device_id):
                       "track for deviceID=%s tracker_id=%s (last seen: %s score=%.2f)",
                       tolerance, device_id, tracker_id,
                       tr["objectType"], tr["score"])
-            # Only a track that joined the event goes in its leave: one that closes while the
-            # event is open without having joined (never confirmed, or never in a zone for its
-            # type, like a car on the far road at 11:57) isn't a participant.
+            # Only a track that joined the event goes in its leave; one that closed unseen or unzoned
+            # is not a participant.
             if (event is not None and not tr.get("stationary_coord")
                     and tr.get("event_id") == event["id"]):
                 event["finished"].append((tracker_id, tr))  # its snapshot goes in the leave
@@ -3240,9 +3283,8 @@ def _motion_tick(ws, device_id):
             parent = CONFIRM_WITH.get(tr["objectType"])
             if tr["objectType"] == "face" and not tr.get("nameable"):
                 continue
-            if parent and not tr.get("confirmed", True) and tr["miss_count"] == 0 and any(
-                    p["objectType"] == parent and p.get("confirmed", True)
-                    and not p.get("stationary_coord") for p in tracks.values()):
+            if parent and not tr.get("confirmed", True) and tr["miss_count"] == 0 \
+                    and _parent_moving(tracks, tr):
                 tr["confirmed"] = True
                 log.info("real motion tick: %s tracker_id=%s confirmed with its %s, joining for "
                          "deviceID=%s", tr["objectType"], tid, parent, device_id)
@@ -3299,6 +3341,10 @@ def _motion_tick(ws, device_id):
                     single()
                 for _, tr in active:  # still in view: quiet until it moves again
                     _park(tr)
+                # The event is closed; teardown must not re-leave it for already-parked tracks.
+                for tr in tracks.values():
+                    if tr.get("event_id") == event["id"]:
+                        tr.pop("event_id", None)
                 dev["event"] = None
             elif now_ms - dev.get("last_report_ms", now_ms - REPORT_INTERVAL_MS) >= REPORT_INTERVAL_MS:
                 # One batched update per report interval, only for tracks seen since the last
@@ -3337,10 +3383,24 @@ def _stop_motion_detector(device_id, preserve_tracks=False, ws=None):
         t.join(timeout=MOTION_POLL_INTERVAL_S + 5.0)
     if preserve_tracks:
         return
+    state = _motion_events.pop(device_id, None)
+    if state and state.get("active") and ws is not None:
+        # The stream is gone, so motion cannot be reported any more: close the event now.
+        try:
+            _send_motion_event(ws, device_id, "stop", state["event_id"],
+                               _frame_wall_ms(device_id))
+        except Exception:
+            log.warning("could not close the motion event for deviceID=%s", device_id)
     with _motion_lock:
         dev = _motion_state.get(device_id)
         open_tracks = list((dev or {}).get("tracks", {}).items())
+        # Participants that already parked are in the event's finished list, not tracks.
+        finished = list(((dev or {}).get("event") or {}).get("finished", []))
         _motion_state.pop(device_id, None)
+    members = {tid: tr for tid, tr in open_tracks}
+    for tid, tr in finished:
+        members.setdefault(tid, tr)
+    open_tracks = list(members.items())
     if not open_tracks:
         return
     if ws is None:
@@ -3753,7 +3813,8 @@ def _upload_snapshot_image(upload_uri, device_info, requested_filename, what=Non
     files_form = {"payload": ("snapshot.jpg", data, "image/jpeg")}
     try:
         resp = requests.post(upload_uri, headers=headers, files=files_form,
-                              cert=(CERT_PATH, KEY_PATH), verify=False, timeout=15)
+                              cert=(CERT_PATH, KEY_PATH), verify=False,
+                              allow_redirects=False, timeout=15)
         log.info("uploaded snapshot (%d bytes) from %s to %s -> %s: %s",
                   len(data), path, _snapshot_uri_label(upload_uri), resp.status_code,
                   resp.text[:300])
@@ -3807,17 +3868,32 @@ def _describe_face_db(path):
     return "sqlite: " + "; ".join(parts)
 
 
+def _face_db_uri_ok(uri, device_info):
+    """Only the console's HTTPS host may receive the client cert and device headers."""
+    try:
+        parts = urlsplit(uri)
+    except (TypeError, ValueError):
+        return False
+    want = str(device_info.get("console_host") or "").strip().lower()
+    return bool(want and parts.scheme == "https" and (parts.hostname or "").lower() == want
+                and not parts.username and not parts.password
+                and not parts.query and not parts.fragment)
+
+
 def _download_face_db(uri, device_info):
     """Fetch the known-faces DB Protect offers (UpdateFaceDBRequest) into
     <state-dir>/facedb/ and log what it contains."""
     if not uri:
         log.warning("UpdateFaceDBRequest had no uri")
         return
+    if not _face_db_uri_ok(uri, device_info):
+        log.warning("refusing a face DB URI that is not the console's HTTPS host")
+        return
     headers = {"x-ident": device_info["mac_nosep"].upper(), "x-type": device_info["type"],
                "x-sysid": device_info["sysid_hex"]}
     try:
         resp = requests.get(uri, headers=headers, cert=(CERT_PATH, KEY_PATH), verify=False,
-                            timeout=30)
+                            allow_redirects=False, timeout=30)
     except requests.RequestException as e:
         log.warning("face DB download from %s failed: %r", uri, e)
         return
@@ -3825,9 +3901,14 @@ def _download_face_db(uri, device_info):
         log.info("face DB download from %s -> %s: %s", uri, resp.status_code, resp.text[:200])
         return
     out_dir = os.path.join(STATE_DIR or HERE, "facedb")
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(out_dir, 0o700)
+    except OSError:
+        pass
     path = os.path.join(out_dir, "known.db")
-    with open(path + ".tmp", "wb") as f:
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(resp.content)
     os.replace(path + ".tmp", path)
     try:
@@ -3885,6 +3966,12 @@ def _box_delay_ms(device_id):
 def _now_ms():
     """(wall ms, monotonic ms) right now."""
     return int(time.time() * 1000), int(time.monotonic() * 1000)
+
+
+def _shared_stamp(stamp, wall):
+    """A shared-decode frame: Protect's wall time for the box, local read time for health
+    and stall checks (never derive the monotonic half from a foreign clock)."""
+    return int(wall), stamp[1]
 
 
 # deviceID -> (wall ms, monotonic ms) a back-filled message describes (_at_frame).
@@ -4408,25 +4495,102 @@ def _used_points():
     return _points_value(sum(_stream_points.values()))
 
 
+def _nonneg_ms(value, default):
+    """A non-negative integer millisecond setting, or `default` for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return default
+    return int(value)
+
+
 def _apply_motion_settings(payload):
-    """Protect's motion zones and sensitivity (each zone's `level`, 0-100) for the motion
-    gate; the detector is rebuilt on its next frame when they change."""
+    """Protect's enhanced-motion settings for a paired camera: motion zones and each zone's
+    `level` for the gate, and the event enable/linger timings for EventSmartMotion."""
     device_id = payload.get("deviceID")
     zones = payload.get("zones")
     if not device_id or not isinstance(zones, dict):
         return
+    previous = _motion_settings.get(device_id) or {}
     levels = [z.get("level") for z in zones.values()
               if isinstance(z, dict) and isinstance(z.get("level"), (int, float))]
-    settings = {"zones": zones, "level": max(levels) if levels else 50}
+    enable = payload.get("enable")
+    settings = {
+        "zones": zones,
+        "level": max(levels) if levels else 50,
+        # A partial message must not silently switch motion events on or off.
+        "enable": enable if isinstance(enable, bool) else previous.get("enable", False),
+        "start_ms": _nonneg_ms(payload.get("lingerEventStartMSec"),
+                               previous.get("start_ms", MOTION_EVENT_DEFAULT_START_MS)),
+        "stop_ms": _nonneg_ms(payload.get("lingerEventStopMSec"),
+                              previous.get("stop_ms", MOTION_EVENT_DEFAULT_STOP_MS)),
+        "max_ms": _nonneg_ms(payload.get("eventMaxDurationMSec"),
+                             previous.get("max_ms", MOTION_EVENT_DEFAULT_MAX_MS)),
+    }
     if _motion_settings.get(device_id) != settings:
         _motion_settings[device_id] = settings
         _motion_detectors.pop(device_id, None)
 
 
-# Experiment 2026-11-04: ONVIF cameras whose ChangeVideoSettings reply says audio is off (empty or
-# 0 for none, 1 for all, or a list of device IDs), while browser live view on them doesn't resume after about a minute
-# away from the page. Only the reply changes: the push keeps its audio track, since Protect's
-# media server needs one to finish initializing.
+def _send_motion_event(ws, device_id, edge_type, event_id, now_ms):
+    """One EventSmartMotion start or stop, in the shape Protect's motionMessage schema
+    requires (motionHeatmap and motionSnapshot must be strings; empty is accepted)."""
+    clock_mono, clock_stream = _stream_clocks(device_id)
+    wall = _clock_wall(device_id, now_ms)
+    send_msg(ws, "EventSmartMotion", {
+        "deviceID": device_id,
+        "clockBestMonotonic": 0,
+        "clockBestWall": wall,
+        "clockMonotonic": clock_mono,
+        "clockStream": clock_stream,
+        "clockStreamRate": 1000,
+        "clockWall": wall,
+        "edgeType": edge_type,
+        "eventId": event_id,
+        "eventType": "motion",
+        "motionHeatmap": "",
+        "motionSnapshot": "",
+    }, response_expected=False)
+    log.info("motion event %s for deviceID=%s (eventId=%d)", edge_type, device_id, event_id)
+
+
+def _update_motion_event(ws, device_id, changed):
+    """Open an EventSmartMotion after motion persists for `lingerEventStartMSec`, close it
+    `lingerEventStopMSec` after the last motion, and split an event at eventMaxDurationMSec."""
+    settings = _motion_settings.get(device_id) or {}
+    state = _motion_events.setdefault(device_id, {"active": False, "event_id": 0,
+                                                   "since_ms": None, "started_ms": None,
+                                                   "last_motion_ms": None})
+    now_ms = _frame_wall_ms(device_id)
+    if not settings.get("enable", False):
+        if state["active"]:
+            _send_motion_event(ws, device_id, "stop", state["event_id"], now_ms)
+            state.update({"active": False, "since_ms": None, "started_ms": None})
+        return
+    if changed:
+        state["last_motion_ms"] = now_ms
+        if state["active"]:
+            max_ms = settings.get("max_ms", MOTION_EVENT_DEFAULT_MAX_MS)
+            if max_ms and now_ms - state["started_ms"] >= max_ms:
+                _send_motion_event(ws, device_id, "stop", state["event_id"], now_ms)
+                state.update({"active": False, "since_ms": None, "started_ms": None})
+            return
+        if state["since_ms"] is None:
+            state["since_ms"] = now_ms
+        if now_ms - state["since_ms"] >= settings.get("start_ms", MOTION_EVENT_DEFAULT_START_MS):
+            state["event_id"] += 1
+            state.update({"active": True, "started_ms": now_ms})
+            _send_motion_event(ws, device_id, "start", state["event_id"], now_ms)
+        return
+    if state["active"]:
+        if now_ms - (state["last_motion_ms"] or now_ms) >= settings.get(
+                "stop_ms", MOTION_EVENT_DEFAULT_STOP_MS):
+            _send_motion_event(ws, device_id, "stop", state["event_id"], now_ms)
+            state.update({"active": False, "since_ms": None, "started_ms": None})
+    else:
+        state["since_ms"] = None
+
+
+# Optional audio-off reply for browsers that fail to resume live view; the push keeps
+# its audio track either way.
 _ONVIF_AUDIO_OFF = onvif_push.parse_camera_list(os.environ.get("AIPORT_ONVIF_AUDIO_OFF"))
 
 
@@ -4444,6 +4608,122 @@ def _onvif_main_size(device_id, payload):
     if src.get("width") and src.get("height"):
         return src["width"], src["height"]
     return payload.get("width"), payload.get("height")
+
+
+_onvif_reply_lock = threading.Lock()
+_onvif_reply_waiting = set()
+_onvif_start_locks = {}
+_onvif_start_locks_lock = threading.Lock()
+
+
+def _onvif_start_lock(device_id):
+    with _onvif_start_locks_lock:
+        return _onvif_start_locks.setdefault(device_id, threading.Lock())
+
+
+def _onvif_video_settings(ws, msg_id, payload, src=None):
+    """Send the ChangeVideoSettings reply from the sizes known now.
+
+    Returns the substream dict used, or None when the camera is on its main stream."""
+    device_id = payload.get("deviceID")
+    src = src or (_onvif.source(device_id) if device_id else None)
+    if not src:
+        send_msg(ws, "ChangeVideoSettings", {
+            "video": {
+                "video1": {"enabled": True, "width": 1920, "height": 1080,
+                           "fps": 25, "bitrate": 4000000},
+                "video2": {"enabled": False},
+                "video3": {"enabled": False},
+            },
+            "audio": {"enabled": False, "volume": 100},
+        }, in_response_to=msg_id)
+        return None
+    probe = _stream_probe.get(device_id) or {}
+    channel = {"enabled": True,
+               "width": probe.get("width") or src["width"] or 1920,
+               "height": probe.get("height") or src["height"] or 1080,
+               "fps": probe.get("fps") or src["fps"] or 15,
+               "bitrate": 8000000}
+    sub = _onvif.substream(device_id)
+    sub_channel = {"enabled": True, "width": sub["width"], "height": sub["height"],
+                   "fps": sub["fps"] or channel["fps"], "bitrate": 1000000} if sub else None
+    video = {k: dict(sub_channel if sub and k in onvif_push.SUB_CHANNELS else channel)
+             for k in payload["video"]}
+    encoded = _onvif.transcode_channels(device_id) or {}
+    for k in video:
+        video[k].update(encoded.get(k) or {})
+    send_msg(ws, "ChangeVideoSettings", {
+        "video": video,
+        "audio": {"enabled": not _reports_audio_off(device_id), "volume": 100},
+    }, in_response_to=msg_id)
+    return sub
+
+
+def _correct_onvif_video_settings(device_id, ws, msg_id, payload, first_sub):
+    """After a background lookup, send a corrected reply if the substream changed."""
+    with _onvif_reply_lock:
+        if device_id in _onvif_reply_waiting:
+            return
+        _onvif_reply_waiting.add(device_id)
+
+    def run():
+        try:
+            _onvif.wait_for_substream(device_id)
+            if _onvif.substream(device_id) != first_sub:
+                _onvif_video_settings(ws, msg_id, payload)
+        except Exception:
+            log.exception("ONVIF video-settings correction failed for deviceID=%s", device_id)
+        finally:
+            with _onvif_reply_lock:
+                _onvif_reply_waiting.discard(device_id)
+
+    threading.Thread(target=run, daemon=True, name=f"onvif-reply-{device_id}").start()
+
+
+def _start_onvif_camera(ws, msg_id, payload):
+    """Start/stop an ONVIF camera away from the WS reader and send its reply."""
+    device_id = payload.get("deviceID")
+    url = payload.get("streamUrl")
+    reply_status = "stopped"
+    with _onvif_start_lock(device_id):
+        if device_id and payload.get("streaming") and url:
+            try:
+                with _reset_lock:
+                    _reset_pending.pop(device_id, None)
+                _stream_restart_count.pop(device_id, None)
+                try:
+                    _start_stream(device_id, None, None, None, payload.get("width"),
+                                  payload.get("height"), url=url)
+                finally:
+                    # Use the probed size for the transcode and Protect's reply. Detection failing to start
+                    # must not cost the camera its video.
+                    width, height = _onvif_main_size(device_id, payload)
+                    _onvif.set_source(device_id, url, audio=payload.get("audio", True),
+                                      width=width, height=height, fps=payload.get("fps"),
+                                      codec=(_stream_probe.get(device_id) or {}).get("codec"))
+                _start_motion_detector(ws, device_id, preserve_tracks=True)
+                # Counted, health-watched and stall-checked like a UiStreamControl camera.
+                points = _stream_points_for(payload.get("width"), payload.get("height"),
+                                            payload.get("fps"))
+                _stream_points[device_id] = points if points is not None else STREAM_POINT_TIERS[0][1]
+                _stream_started_at[device_id] = time.monotonic()
+                _start_status_watch()
+                reply_status = "started"
+            except Exception:
+                log.exception("failed to start ONVIF camera deviceID=%s", device_id)
+        elif device_id:
+            _onvif.stop_device(device_id)
+            with _reset_lock:
+                _reset_pending.pop(device_id, None)
+            _stream_points.pop(device_id, None)
+            _stop_motion_detector(device_id, ws=ws)
+            _stop_stream(device_id)
+    send_msg(ws, "OnvifStreamControl", {"status": reply_status, "usedPoints": _used_points()},
+             in_response_to=msg_id)
+    if device_id and reply_status == "started":
+        _send_status_event(ws, device_id, plug=True, streaming=True,
+                           smart_ready=True, audio_ready=AUDIO_EVENT_READY)
+        _send_feature_flags_event(ws, device_id)
 
 
 def _stop_one_stream(device_id, preserve_tracks=True, ws=None):
@@ -4549,51 +4829,10 @@ def handle_function(ws, msg, device_info):
                 _send_feature_flags_event(ws, device_id)
         return
     if fn == "OnvifStreamControl":
-        # Assigning an ONVIF camera: we pull its RTSP for detection and push its
-        # video to Protect (channels arrive via ChangeVideoSettings with this deviceID).
-        device_id = payload.get("deviceID")
-        url = payload.get("streamUrl")
-        reply_status = "stopped"
-        if device_id and payload.get("streaming") and url:
-            try:
-                with _reset_lock:
-                    _reset_pending.pop(device_id, None)
-                _stream_restart_count.pop(device_id, None)
-                try:
-                    _start_stream(device_id, None, None, None, payload.get("width"),
-                                  payload.get("height"), url=url)
-                finally:
-                    # After the probe: a transcode encodes at this size and Protect is told it,
-                    # so the camera's real size beats the announced one. Detection failing to
-                    # start must not cost the camera its video.
-                    width, height = _onvif_main_size(device_id, payload)
-                    _onvif.set_source(device_id, url, audio=payload.get("audio", True),
-                                      width=width, height=height, fps=payload.get("fps"))
-                _start_motion_detector(ws, device_id, preserve_tracks=True)
-                # Counted, health-watched and stall-checked like a UiStreamControl camera.
-                points = _stream_points_for(payload.get("width"), payload.get("height"),
-                                            payload.get("fps"))
-                _stream_points[device_id] = points if points is not None else STREAM_POINT_TIERS[0][1]
-                _stream_started_at[device_id] = time.monotonic()
-                _start_status_watch()
-                reply_status = "started"
-            except Exception:
-                log.exception("failed to start ONVIF camera deviceID=%s", device_id)
-        elif device_id:
-            # Stop, don't forget: Protect often re-issues only streaming:true
-            # (not ChangeVideoSettings), and the destinations are still valid.
-            _onvif.stop_device(device_id)
-            with _reset_lock:
-                _reset_pending.pop(device_id, None)
-            _stream_points.pop(device_id, None)
-            _stop_motion_detector(device_id, ws=ws)
-            _stop_stream(device_id)
-        send_msg(ws, "OnvifStreamControl", {"status": reply_status, "usedPoints": _used_points()},
-                 in_response_to=msg_id)
-        if device_id and reply_status == "started":
-            _send_status_event(ws, device_id, plug=True, streaming=True,
-                               smart_ready=True, audio_ready=AUDIO_EVENT_READY)
-            _send_feature_flags_event(ws, device_id)
+        # Assigning an ONVIF camera: pull its RTSP and push its video in a worker, so a
+        # slow probe or profile lookup does not block every other camera's WS message.
+        threading.Thread(target=_start_onvif_camera, args=(ws, msg_id, payload),
+                         daemon=True, name="onvif-start").start()
         return
     if fn == "GetStreamList":
         # Protect asks on every connect; a non-empty list makes it send ResetAIPortStreams
@@ -4635,44 +4874,16 @@ def handle_function(ws, msg, device_info):
     if fn == "ChangeVideoSettings":
         # With a deviceID this configures ONVIF channel pushes; either way the reply is also
         # a query (the controller builds its channel list from it), so `{}` blocks provisioning.
-        onvif_src = None
-        if payload.get("deviceID") and isinstance(payload.get("video"), dict):
-            _onvif.configure(payload["deviceID"], payload["video"])
-            onvif_src = _onvif.source(payload["deviceID"])
-            _onvif.wait_for_substream(payload["deviceID"])
-        if onvif_src:
-            # Channels carry the camera's main stream (video2/video3 its substream, if it
-            # has one), so report their real geometry -- the main one probed, since Protect
-            # echoes back whatever we answered before. A wrong size breaks the web
-            # player (it sizes its decoder from it).
-            probe = _stream_probe.get(payload["deviceID"]) or {}
-            channel = {"enabled": True,
-                       "width": probe.get("width") or onvif_src["width"] or 1920,
-                       "height": probe.get("height") or onvif_src["height"] or 1080,
-                       "fps": probe.get("fps") or onvif_src["fps"] or 15,
-                       "bitrate": 8000000}
-            sub = _onvif.substream(payload["deviceID"])
-            sub_channel = {"enabled": True, "width": sub["width"], "height": sub["height"],
-                           "fps": sub["fps"] or channel["fps"], "bitrate": 1000000} if sub else None
-            video = {k: dict(sub_channel if sub and k in onvif_push.SUB_CHANNELS else channel)
-                     for k in payload["video"]}
-            encoded = _onvif.transcode_channels(payload["deviceID"]) or {}
-            for k in video:
-                video[k].update(encoded.get(k) or {})
-            send_msg(ws, "ChangeVideoSettings", {
-                "video": video,
-                "audio": {"enabled": not _reports_audio_off(payload["deviceID"]), "volume": 100},
-            }, in_response_to=msg_id)
-            return
-        send_msg(ws, "ChangeVideoSettings", {
-            "video": {
-                "video1": {"enabled": True, "width": 1920, "height": 1080,
-                           "fps": 25, "bitrate": 4000000},
-                "video2": {"enabled": False},
-                "video3": {"enabled": False},
-            },
-            "audio": {"enabled": False, "volume": 100},
-        }, in_response_to=msg_id)
+        device_id = payload.get("deviceID")
+        if device_id and isinstance(payload.get("video"), dict):
+            _onvif.configure(device_id, payload["video"])
+            src = _onvif.source(device_id)
+            if src:
+                first_sub = _onvif_video_settings(ws, msg_id, payload, src)
+                if _onvif.substream_pending(device_id):
+                    _correct_onvif_video_settings(device_id, ws, msg_id, payload, first_sub)
+                return
+        _onvif_video_settings(ws, msg_id, payload)  # generic fallback or no source yet
         return
     if fn == "ChangeIspSettings":
         # Same query-not-push pattern as ChangeVideoSettings; minimal best-effort shape.
@@ -4844,12 +5055,8 @@ def _clear_adopt_state():
 # No wait-for-adopt gate: the unsolicited pre-adopt connection is load-bearing for candidate identity.
 
 
-# An adopted AI Port that Protect has been hanging up on, without a word, for this long is
-# probably no longer adopted (0: never warn). Protect sends no reason, and ResetToDefaults only
-# comes if we're connected at the moment of the removal: it isn't once in the log from
-# 2026-10-28 through four removals. Live 2026-11-02 19:30 on the ONVIF test instance: 699 closes
-# in a row with a token in adopt_state.json, each a generic ConnectionClosedError. Ordinary
-# reconnects settled sooner (65-78 s on 2026-11-03 and 2026-11-04), so this waits longer.
+# Warn after this long of unexplained closes: Protect removal looks like ordinary
+# reconnects, but those settled much sooner in the live logs.
 REFUSED_WARN_S = envutil.env_float("AIPORT_REFUSED_WARN_S", 180)
 
 
@@ -5060,6 +5267,10 @@ def main():
         # RAM-only handoff; http_api.py derives the same dir from --state-dir.
         _STREAM_DIR = config.stream_dir(args.state_dir)
         STATE_DIR = args.state_dir
+    else:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    # The restream child inherits this, so both sides name the same detect socket.
+    os.environ["AIPORT_DETECT_NAMESPACE"] = os.path.abspath(STATE_DIR or HERE)
     _reset_stream_dir()
     if hoststats.enabled():
         # Once a minute beside the frame stats: CPU by diy-port/Frigate/OrbStack, GPU, ANE.

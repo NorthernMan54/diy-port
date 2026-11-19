@@ -146,7 +146,7 @@ sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
 
 Options: `--name NAME`, `--accel auto|rknn|edgetpu|openvino|cpu|none` (default `auto`; `--no-npu`
 is an alias for `none`), `--rknn PATH`, `--rknn-url URL` / `--rknn-sha256 HEX`,
-`--webui-port N`. Run as root. The manual equivalent:
+`--webui-port N`, `--webui-bind ADDR` (default `127.0.0.1`; `0.0.0.0` for LAN, no auth). Run as root. The manual equivalent:
 
 ```bash
 pip install -r requirements.txt
@@ -463,7 +463,7 @@ default; `0` turns it off). Detection decodes the video1 this instance pushes to
 camera itself, and each frame carries the wall time Protect places it at, so boxes line up
 with no `AIPORT_BOX_DELAY_MS` (set it to 0 for these cameras). Without it, boxes led the
 video by about 1.9 s in isolated mode, by an amount that moved with load. It also saves one
-camera session per camera, at about the same CPU.
+camera session per camera, at about the same CPU. Modes and costs: `../docs/onvif-modes.md`.
 
 A track only joins an event once it confirms (Protect's `eventStartMSec`, 1 s), so a car that
 crosses the road in a second used to get its first box as it left. A track keeps its box from
@@ -667,6 +667,14 @@ RTSP URL, `streaming` true/false) and, per channel, `ChangeVideoSettings` with a
 `extendedFlv` `avSerializer`: a `streamName` and `tcp://<console>:7550` as destination.
 Protect's own ingest for that camera stops; without the push the camera has no video.
 
+The ONVIF device service is tried on `http` port 80 and 8080, after a non-554
+port from the RTSP URL; `AIPORT_ONVIF_HTTP_PORT` and `AIPORT_ONVIF_SCHEME`
+(`http`/`https`) override that. `XAddr` and `GetStreamUri` must stay on the
+camera's host; `AIPORT_ONVIF_ALLOW_HOSTS` adds exceptions for cameras that
+answer with another interface address. Only plain `rtsp://` or `rtsps://` sources
+reach ffmpeg or gst-launch: `file:`, `concat:`, `http:` and URLs containing
+whitespace or `!` are rejected before a process starts.
+
 `OnvifStreamControl` names only the main profile. `onvif_media.py` asks the camera's
 ONVIF Media service (GetCapabilities, GetProfiles, GetStreamUri, WS-Security digest
 with the RTSP URL's login) for the rest, once per URL, and `video2`/`video3` carry the
@@ -742,7 +750,8 @@ MAC and propagates the overridable subset on the next reconnect pass.
 
 Tracking changes are checked offline on recorded clips instead of waiting for live events.
 Record what a paired camera sends while diy-port is running (it finds the stream URL and the
-camera's Protect settings in `~/diyport.log`):
+camera's Protect settings in the instance's `logs/diyport.log`, by default
+`~/.diy-port/native/logs/diyport.log`):
 
 ```bash
 scripts/record_clip.py 02000000000C 60 camera-walk

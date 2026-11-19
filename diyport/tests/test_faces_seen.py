@@ -55,8 +55,8 @@ class TestFacesSeen(unittest.TestCase):
         self.assertEqual(crop.shape[:2], (200, 200))
         self.assertTrue(os.path.isdir(self.faces))     # the gallery folder is made too
         for path in (self.seen, self.faces):
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o777)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.seen, files[0])).st_mode), 0o666)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.seen, files[0])).st_mode), 0o600)
 
     def test_crop_is_clamped_to_the_frame(self):
         av._save_face_crop("CAM", 1, self.face_track(coord=(0, 0, 200, 200)))

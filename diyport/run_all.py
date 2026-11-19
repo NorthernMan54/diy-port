@@ -123,16 +123,22 @@ def main():
     ap.add_argument("--hostname", default=cfg["hostname"])
     ap.add_argument("--fallback-host-port", default=None)
     ap.add_argument("--state-dir", default=None,
-                     help="isolate this instance's adopt_state.json/certs/streams under a "
-                          "dedicated directory instead of the shared default paths -- "
-                          "required when running more than one AI Port instance on the same "
-                          "box (see instance_manager.py)")
+                     help="this instance's adopt_state.json/certs/streams; defaults to "
+                          "$XDG_STATE_HOME/diyport or ~/.local/state/diyport, and is required "
+                          "to run more than one instance (see instance_manager.py)")
     ap.add_argument("--device-id", default=cfg["device_id"],
                      help="AI Port's own device identity (shared by ucp4_client.py and "
                           "avclient.py -- 'same physical device'); defaults to the "
                           "cfg value, which MUST be unique per instance when running more "
                           "than one")
     args = ap.parse_args()
+
+    if not args.state_dir:
+        args.state_dir = config.default_state_dir()
+        moved = config.migrate_repo_state(args.state_dir)
+        if moved:
+            print(f"Migrated legacy repo state to {args.state_dir}: {', '.join(moved)}")
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
 
     # macOS lets any user bind ports below 1024 (since 10.14), so it runs under the user's own
     # account there (scripts/macos_launchd.sh); elsewhere :443 needs root.
@@ -186,9 +192,8 @@ def main():
         for a in (discovery_args, http_args, wss_args, classic_args):
             a += ["--mac", args.mac]
 
-    if args.state_dir:
-        for a in (discovery_args, http_args, wss_args, classic_args):
-            a += ["--state-dir", args.state_dir]
+    for a in (discovery_args, http_args, wss_args, classic_args):
+        a += ["--state-dir", args.state_dir]
     if args.device_id:
         # All stages must share one device-id, else multi-instance discover/info breaks.
         http_args += ["--device-id", args.device_id]

@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 # Run diy-port under launchd on macOS: started at boot or login, restarted if it exits, logging
 # with rotation (scripts/diyport_service.sh does the work). Each instance has its own folder,
 # ~/.diy-port/$DIYPORT_INSTANCE/ ("native" when not set; see scripts/diyport_paths.sh), and its
@@ -88,7 +89,10 @@ state_dir() {
 
 migrate_legacy() {
     # The single instance from before ~/.diy-port becomes "native", with the same identity.
-    [ -n "$LEGACY" ] && [ -z "$DAEMON" ] || return 0
+    [ -n "$LEGACY" ] || return 0
+    if [ -n "$DAEMON" ]; then
+        die "legacy $LEGACY_ENV_FILE found; run '$0 install' as $USER_NAME first to migrate it, then install --daemon"
+    fi
     local old_plist=$USER_HOME/Library/LaunchAgents/$OLD_LABEL.plist
     if loaded "$OLD_LABEL"; then
         echo "stopping the old $OLD_LABEL agent"
@@ -114,14 +118,25 @@ migrate_legacy() {
     . "$REPO/scripts/diyport_paths.sh"   # now the new paths
 }
 
+stream_dir() {
+    # Ask config.stream_dir, so $TMPDIR and the state-dir hash match what the agent uses.
+    [ -x "$REPO/venv/bin/python" ] || return 0
+    "$REPO/venv/bin/python" - "$REPO/diyport" "$(state_dir)" <<'PY' 2>/dev/null || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import config
+print(config.stream_dir(sys.argv[2]))
+PY
+}
+
 check_ownership() {
-    # Everything an agent writes must be yours: its state dir, the stream dir under /tmp, the
-    # repo (compiled files, the Apple helper build) and the log. A daemon is root.
+    # Everything an agent writes must be yours: its state dir, the stream dir, the repo
+    # (compiled files, the Apple helper build) and the log. A daemon is root.
     [ -z "$DAEMON" ] || return 0
-    # The stream dir is this instance's own under the shared /tmp/aiport-streams
-    # (config.stream_dir: a hash of the state dir's path).
     local paths=("$REPO" "$LOG" "$(state_dir)")
-    paths+=("/private/tmp/aiport-streams/$(printf %s "$(state_dir)" | shasum | cut -c1-12)")
+    local stream
+    stream=$(stream_dir)
+    [ -n "$stream" ] && paths+=("$stream")
     local bad=()
     for p in "${paths[@]}"; do
         [ -e "$p" ] || continue
@@ -141,15 +156,16 @@ check_ownership() {
 check_not_running() {
     # This instance only (its state dir), so another instance can keep running.
     # A job just booted out takes a few seconds to stop (ExitTimeOut), so wait for it first.
-    local pids pattern="diyport/run_all.py .*--state-dir $(state_dir)( |$)"
+    local pids pattern
+    pattern="diyport/run_all.py .*--state-dir $(state_dir)( |$)"
     for _ in $(seq 1 30); do
         pids=$(pgrep -f "$pattern" || true)
         [ -z "$pids" ] && break
         sleep 1
     done
     if [ -n "$pids" ] && ! loaded "$LABEL"; then
-        echo "$INSTANCE is already running outside launchd (pid $(echo $pids | tr ' ' ','))." >&2
-        echo "Stop it first (Ctrl-C in its terminal, or: sudo kill -INT $(echo $pids | tr ',' ' '))." >&2
+        echo "$INSTANCE is already running outside launchd (pid $(printf '%s' "$pids" | tr ' ' ','))." >&2
+        echo "Stop it first (Ctrl-C in its terminal, or: sudo kill -INT $(printf '%s' "$pids" | tr ',' ' '))." >&2
         exit 1
     fi
 }
@@ -158,9 +174,7 @@ write_plist() {
     mkdir -p "$(dirname "$PLIST")" "$(dirname "$LAUNCHD_LOG")"
     local extra=""
     if [ -n "$DAEMON" ]; then
-        # SUDO_USER/SUDO_UID: the wrapper finds your home folder from them, and the Apple
-        # vehicle model's helper runs as you. No .pyc files: root's would block the agent's
-        # ownership check on the shared repo.
+        # Let the wrapper find your home and run the Apple helper as you; no root-owned .pyc.
         extra="
         <key>SUDO_USER</key><string>$USER_NAME</string>
         <key>SUDO_UID</key><string>$USER_ID</string>

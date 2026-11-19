@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import onvif_push  # noqa: E402
 import shared_decode as sd  # noqa: E402
 
-DETECT_FPS = 10
+DETECT_FPS = 10  # tests pin the rate they exercise; avclient.DETECT_FPS is env-tunable
 
 
 class TestSharedDecodeKeep(unittest.TestCase):
-    """Live 2026-11-07 on 92DE633106E8 (15 fps): a whole stride, round(15/10) = 2, gave
+    """Live 2026-11-07 on a 15 fps camera: a whole stride, round(15/10) = 2, gave
     7.5 fps and "falling behind" every minute; keep 10 of every 15, evenly spread."""
 
     def kept(self, fps, n=60):
@@ -49,6 +54,49 @@ class TestSharedDecodeKeep(unittest.TestCase):
                if "pts:" in line and "showinfo" in line]
         expect = [i for i in range(45) if sd.keeps(i, keep)]
         self.assertEqual(pts, expect)
+
+
+class TestFeed(unittest.TestCase):
+    class _Stdin:
+        def __init__(self):
+            self.data = b""
+        def write(self, data):
+            self.data += data
+        def close(self):
+            pass
+
+    class _Proc:
+        def __init__(self):
+            self.stdin = TestFeed._Stdin()
+        def poll(self):
+            return None
+
+    def test_records_reach_ffmpeg_and_kept_frames_queue_their_wall_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "detect.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(server.close)
+            server.bind(path)
+            server.listen(1)
+
+            def serve():
+                conn, _ = server.accept()
+                with conn:
+                    conn.sendall(onvif_push.DETECT_RECORD.pack(
+                        onvif_push.DETECT_FRAME, 1000.0, 1) + b"a")
+                    conn.sendall(onvif_push.DETECT_RECORD.pack(
+                        onvif_push.DETECT_BYTES, 0.0, 3) + b"hdr")
+                    conn.sendall(onvif_push.DETECT_RECORD.pack(
+                        onvif_push.DETECT_FRAME, 2000.0, 1) + b"b")
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            proc = self._Proc()
+            walls = []
+            sd.feed("CAM", proc, path, (1, 1), walls)
+            thread.join(2.0)
+            self.assertEqual(walls, [1000.0, 2000.0])
+            self.assertEqual(proc.stdin.data, b"ahdrb")
 
 
 if __name__ == "__main__":

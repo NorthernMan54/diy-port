@@ -341,6 +341,36 @@ class TestFaceDrop(unittest.TestCase):
 _SAMPLES = os.environ.get("AIPORT_ENRICH_SAMPLES")
 
 
+class TestModelRetry(unittest.TestCase):
+    def test_plate_load_failure_retries_next_call(self):
+        from unittest import mock
+        e = enrich.Enricher()
+        e.lpr = True
+        with mock.patch.object(e, "_get_alpr", side_effect=OSError("model busy")) as get:
+            self.assertEqual(e.plates(_solid((0, 0, 0)), []), [])
+            self.assertEqual(e.plates(_solid((0, 0, 0)), []), [])
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(e.lpr)
+
+    def test_face_load_failure_retries_next_call(self):
+        from unittest import mock
+        e = enrich.Enricher()
+        e.face = True
+        with mock.patch.object(e, "_get_face_models", side_effect=OSError("model busy")) as get:
+            self.assertEqual(e.faces(_solid((0, 0, 0)), []), [])
+            self.assertEqual(e.faces(_solid((0, 0, 0)), []), [])
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(e.face)
+
+    def test_missing_gallery_forces_a_rebuild_when_it_returns(self):
+        e = enrich.Enricher(faces_dir="/nonexistent/diyport-faces")
+        e._gallery = [("old", object())]
+        e._gallery_stamp = ("old", 1)
+        e._refresh_gallery(None, object())
+        self.assertEqual(e._gallery, [])
+        self.assertIsNone(e._gallery_stamp)
+
+
 @unittest.skipUnless(_SAMPLES and enrich.lpr_available() and enrich.face_available(),
                      "set AIPORT_ENRICH_SAMPLES (plate.png, lena.jpg) with fast-alpr + face models")
 class TestModels(unittest.TestCase):

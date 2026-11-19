@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 """Unit and real-process tests for onvif_restream.py: a camera's video push in its own process."""
+import io
+import json
 import os
 import signal
 import socket
@@ -96,6 +99,8 @@ class TestRemotePush(unittest.TestCase):
         self.assertTrue(self.push.matches("rtsp://c", "S", DEST, self.renditions))
         self.assertFalse(self.push.matches("rtsp://c", "S2", DEST, self.renditions))
         self.assertFalse(self.push.matches("rtsp://c", "S", DEST))
+        self.assertTrue(self.push.matches("rtsp://c", "S", DEST, self.renditions, True))
+        self.assertFalse(self.push.matches("rtsp://c", "S", DEST, self.renditions, False))
 
     def test_forwards_to_its_worker(self):
         self.assertIs(self.push.start(), self.push)
@@ -103,6 +108,10 @@ class TestRemotePush(unittest.TestCase):
         self.push.restart_source("re-send")
         self.worker.send.assert_called_once_with(
             {"op": "restart_source", "channel": "video1", "reason": "re-send"})
+        self.push.reconnect("re-send")
+        self.assertEqual(self.worker.send.call_args,
+                         mock.call({"op": "reconnect", "channel": "video1",
+                                    "reason": "re-send"}))
         self.push.stop()
         self.worker.remove.assert_called_once_with(self.push)
 
@@ -143,6 +152,12 @@ class TestProcessCommands(unittest.TestCase):
         self.made[0].restart_source.assert_called_once_with("re-send")
         self.p.handle({"op": "restart_source", "channel": "video9"})    # none: ignored
 
+    def test_reconnect_reaches_the_push(self):
+        self._start()
+        self.p.handle({"op": "reconnect", "channel": "video1", "reason": "re-send"})
+        self.made[0].reconnect.assert_called_once_with("re-send")
+        self.p.handle({"op": "reconnect", "channel": "video9"})         # none: ignored
+
     def test_report_says_nothing_until_a_frame_is_sent(self):
         # A new push's last_sent is its creation: reporting that would make a replacement
         # look healthy, and the restream warning would never fire.
@@ -150,6 +165,59 @@ class TestProcessCommands(unittest.TestCase):
         self.assertEqual(self.p.report(now=130.0), {"video1": None})
         self.made[0].last_sent = 125.0
         self.assertEqual(self.p.report(now=130.0), {"video1": 5.0})
+
+
+class TestCommandLogging(unittest.TestCase):
+    def test_a_failed_command_never_logs_the_rtsp_login(self):
+        safe = rs._command_summary({"op": "start", "channel": "video1",
+                                    "url": "rtsp://admin:s3cr3t@192.0.2.10/1"})
+        self.assertNotIn("s3cr3t", str(safe))
+        self.assertIn("192.0.2.10/1", str(safe))
+
+
+class TestMainLogging(unittest.TestCase):
+    def test_bad_json_is_not_echoed(self):
+        line = '{"op": "start", "url": "rtsp://admin:s3cr3t@192.0.2.10/1"\n'
+
+        class IdleProcess:
+            def handle(self, command):
+                raise AssertionError("bad JSON must not reach handle")
+            def report(self):
+                return {}
+            def stop_all(self):
+                pass
+
+        with mock.patch.object(rs, "_private_pipes",
+                               return_value=(io.StringIO(line), io.StringIO())), \
+                mock.patch.object(rs, "Process", return_value=IdleProcess()), \
+                mock.patch("config.apply_logging"), \
+                self.assertLogs("aiport-onvif", "WARNING") as logs:
+            rs.main(["diyport-onvif", "CAM"])
+        output = "\n".join(logs.output)
+        self.assertNotIn("s3cr3t", output)
+        self.assertIn("bad command", output)
+
+    def test_the_main_loop_redacts_a_failed_command(self):
+        line = json.dumps({"op": "start", "channel": "video1",
+                           "url": "rtsp://admin:s3cr3t@192.0.2.10/1"}) + "\n"
+
+        class BrokenProcess:
+            def handle(self, command):
+                raise KeyError("name")
+            def report(self):
+                return {}
+            def stop_all(self):
+                pass
+
+        with mock.patch.object(rs, "_private_pipes",
+                               return_value=(io.StringIO(line), io.StringIO())), \
+                mock.patch.object(rs, "Process", return_value=BrokenProcess()), \
+                mock.patch("config.apply_logging"), \
+                self.assertLogs("aiport-onvif", "ERROR") as logs:
+            rs.main(["diyport-onvif", "CAM"])
+        output = "\n".join(logs.output)
+        self.assertNotIn("s3cr3t", output)
+        self.assertIn("192.0.2.10/1", output)
 
 
 class TestWorkerReports(unittest.TestCase):
@@ -288,13 +356,14 @@ while True:
         proc.stdout.close()
 
     def test_a_push_back_in_time_keeps_the_process(self):
-        with mock.patch.object(rs, "IDLE_S", 0.3):
+        with mock.patch.object(rs, "IDLE_S", 0.1), \
+                mock.patch.object(rs.threading, "Timer"):
             worker, push = self._start_push()
             proc = worker.proc
             push.stop()
             again = rs.RemotePush(worker, "video1", "rtsp://cam/101", "S", self.dest, self.ffmpeg,
                                   True, None).start()
-            time.sleep(0.6)
+            worker._retire()  # what the idle timer would do
             self.assertIs(worker.proc, proc)
             self.assertIs(worker.pushes["video1"], again)
 

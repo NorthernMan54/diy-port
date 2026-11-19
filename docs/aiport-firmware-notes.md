@@ -134,10 +134,12 @@ per-zone `levels`.
    1 s / 3 s). Protect sends both in `ChangeSmartDetectSettings`. diy-port's
    `AIPORT_MISS_S = 3` matches the default by coincidence. The G5 Bullet's ~2 s may
    mean Protect sends a different value.
-2. **Add motion detection per camera.** The AI Port runs `ubnt_smart_motion` for
-   each paired camera, and Protect ignores the camera's own motion events.
-   Implementing `EventSmartMotion` with `lingerEventStartMSec`/`StopMSec` and pulses
-   closes gap 2 in [protect-aiport-controller.md](protect-aiport-controller.md#gaps-in-diy-port).
+2. ~~**Add motion detection per camera.**~~ Done: the per-frame motion gate sends
+   `EventSmartMotion` `start`/`stop` using `lingerEventStartMSec`/`lingerEventStopMSec`
+   and `eventMaxDurationMSec` from `ChangeSmartMotionSettings`; it is enabled only when
+   Protect sets `enable: true`. Pulses and per-zone `levels` are not sent. Original
+   finding: the AI Port runs `ubnt_smart_motion` for each paired camera, and Protect
+   ignores the camera's own motion events.
 3. **Tracking could move closer to the real one:** two-pass IoU + Hungarian matching
    (high- then low-confidence), lost tracks turning stationary after a timeout, and a
    warmup period.

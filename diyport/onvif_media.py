@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 """An ONVIF camera's media profiles, for pushing its substream on a low channel.
 
 Protect's OnvifStreamControl names one RTSP URL (the camera's main profile), so
@@ -12,12 +13,90 @@ import datetime
 import hashlib
 import logging
 import os
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urlsplit, urlunsplit
 from xml.sax.saxutils import escape
 
+import envutil
+
 log = logging.getLogger("aiport-onvif")
+
+MAX_SOAP_BYTES = 256 * 1024
+ONVIF_SCHEME = (os.environ.get("AIPORT_ONVIF_SCHEME") or "http").strip().lower()
+if ONVIF_SCHEME not in ("http", "https"):
+    ONVIF_SCHEME = "http"
+ONVIF_HTTP_PORT = envutil.env_int("AIPORT_ONVIF_HTTP_PORT", 0)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A camera cannot bounce the WS-Security request to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = urlsplit(newurl).hostname or "?"
+        raise urllib.error.URLError(f"ONVIF redirect refused ({host})")
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _allowed_hosts(main_host):
+    extra = (os.environ.get("AIPORT_ONVIF_ALLOW_HOSTS") or "").split(",")
+    return {main_host.lower()} | {h.strip().lower() for h in extra if h.strip()}
+
+
+def _endpoint_ok(url, allowed, schemes, allow_userinfo=False):
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return False
+    if p.scheme not in schemes or not p.hostname or p.hostname.lower() not in allowed:
+        return False
+    try:
+        port = p.port
+    except ValueError:
+        return False
+    if port is not None and not 1 <= port <= 65535:
+        return False
+    if p.fragment or (p.username and not allow_userinfo):
+        return False
+    return True
+
+
+def _read_capped(resp):
+    data = resp.read(MAX_SOAP_BYTES + 1)
+    if len(data) > MAX_SOAP_BYTES:
+        raise ValueError("ONVIF response too large")
+    return data
+
+
+def _device_bases(main_url):
+    """(scheme://host[:port], ...) to try for the device service, most likely first."""
+    parts = urlsplit(main_url)
+    host = parts.hostname
+    if not host:
+        raise ValueError("ONVIF URL has no host")
+    hostpart = f"[{host}]" if ":" in host else host
+    try:
+        rtsp_port = parts.port
+    except ValueError:
+        rtsp_port = None
+    default = 443 if ONVIF_SCHEME == "https" else 80
+    ports = []
+    if ONVIF_HTTP_PORT:
+        ports.append(ONVIF_HTTP_PORT)
+    else:
+        if rtsp_port and rtsp_port != 554:
+            ports.append(rtsp_port)
+        ports += [80, 8080]
+    seen = set()
+    for port in ports:
+        if port in seen:
+            continue
+        seen.add(port)
+        netloc = hostpart if port == default else f"{hostpart}:{port}"
+        yield f"{ONVIF_SCHEME}://{netloc}"
 
 _WSSE = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
 _WSU = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
@@ -74,11 +153,12 @@ def _int(s):
 
 
 def _with_userinfo(url, main):
-    """The profile's RTSP URL carrying the main URL's login (GetStreamUri omits it)."""
+    """The profile's RTSP URL carrying the main URL's login, never the camera's own."""
     m, u = urlsplit(main), urlsplit(url)
-    if "@" not in m.netloc or "@" in u.netloc:
-        return url
-    return urlunsplit(u._replace(netloc=m.netloc.rsplit("@", 1)[0] + "@" + u.netloc))
+    host = u.netloc.rsplit("@", 1)[-1]
+    if "@" in m.netloc:
+        host = m.netloc.rsplit("@", 1)[0] + "@" + host
+    return urlunsplit(u._replace(netloc=host))
 
 
 def parse_profiles(xml):
@@ -106,25 +186,40 @@ def fetch_profiles(main_url, timeout=5.0, post=None):
 
     `post(url, body) -> response text` is for tests; it defaults to a SOAP POST."""
     parts = urlsplit(main_url)
+    host = parts.hostname
+    if not host:
+        raise ValueError("ONVIF URL has no host")
     user, password = unquote(parts.username or ""), unquote(parts.password or "")
+    allowed = _allowed_hosts(host)
+    bases = list(_device_bases(main_url))
 
     def soap(url, body):
+        if not _endpoint_ok(url, allowed, ("http", "https")):
+            raise ValueError(f"refusing ONVIF endpoint host {urlsplit(url).hostname or '?'}")
         data = _envelope(body, user, password).encode()
         if post:
             return post(url, data)
         req = urllib.request.Request(url, data=data, headers={
             "Content-Type": "application/soap+xml; charset=utf-8"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return _read_capped(resp)
 
-    media = f"http://{parts.hostname}/onvif/Media"
-    try:
-        caps = ET.fromstring(soap(f"http://{parts.hostname}/onvif/device_service",
-                                  "<tds:GetCapabilities><tds:Category>Media</tds:Category>"
-                                  "</tds:GetCapabilities>"))
-        media = _text(caps, "Media", "XAddr") or media
-    except Exception as e:
-        log.debug("ONVIF GetCapabilities on %s failed (%s); trying %s", parts.hostname, e, media)
+    media = bases[0] + "/onvif/Media"
+    for base in bases:
+        try:
+            caps = ET.fromstring(soap(base + "/onvif/device_service",
+                                      "<tds:GetCapabilities><tds:Category>Media</tds:Category>"
+                                      "</tds:GetCapabilities>"))
+            xaddr = _text(caps, "Media", "XAddr")
+            if xaddr:
+                if _endpoint_ok(xaddr, allowed, ("http", "https")):
+                    media = xaddr
+                else:
+                    log.warning("ONVIF camera %s returned an off-host Media XAddr; using %s",
+                                host, media)
+            break
+        except Exception as e:
+            log.debug("ONVIF GetCapabilities on %s failed (%s); trying next", host, e)
     profiles = parse_profiles(soap(media, "<trt:GetProfiles/>"))
     for p in profiles:
         resp = soap(media, (
@@ -132,7 +227,11 @@ def fetch_profiles(main_url, timeout=5.0, post=None):
             "<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup>"
             f"<trt:ProfileToken>{escape(p['token'] or '')}</trt:ProfileToken></trt:GetStreamUri>"))
         uri = _text(ET.fromstring(resp), "Uri")
-        p["url"] = _with_userinfo(uri, main_url) if uri else None
+        if uri and not _endpoint_ok(uri, allowed, ("rtsp", "rtsps"), allow_userinfo=True):
+            log.warning("ONVIF camera %s returned an off-host stream URI; ignoring it", host)
+            p["url"] = None
+        else:
+            p["url"] = _with_userinfo(uri, main_url) if uri else None
     return profiles
 
 

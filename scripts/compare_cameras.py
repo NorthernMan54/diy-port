@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 """Compare cameras side by side from diy-port logs, e.g. one camera's old feed and its ONVIF
 replacement on two instances. For each camera, over the last --minutes: objects reported to
 Protect (distinct tracks by type), plates read, frame rates, time per detection pass, minutes
 falling behind, and stream trouble. Appends one line per camera to --out.
 
-  scripts/compare_cameras.py native:AABBCC3344CC:old onvif:80BEAF928356:onvif
+  scripts/compare_cameras.py native:AABBCC000001:relayed onvif:AABBCC000002:onvif
 
 Each camera is instance:deviceID[:label]; the instance's log is
 ~/.diy-port/<instance>/logs/diyport.log. Standard library only, so Apple's python3 runs it.
@@ -28,10 +29,7 @@ TROUBLE = re.compile(r"not streaming|pull died|exited rc=|attempt (?:[2-9]|\d\d)
 def scan(path, since, ids):
     stats = {i: {"tracks": set(), "plates": set(), "frames": [], "behind": 0, "trouble": 0}
              for i in ids}
-    try:
-        f = open(path, errors="replace")
-    except OSError as e:
-        sys.exit(f"compare_cameras: {e}")
+    f = open(path, errors="replace")
     with f:
         for line in f:
             if line[:19] < since or "deviceID" not in line:
@@ -80,7 +78,11 @@ def main():
     lines = []
     for inst, cams in by_instance.items():
         log = os.path.expanduser(f"~/.diy-port/{inst}/logs/diyport.log")
-        stats = scan(log, since, [d for d, _ in cams])
+        try:
+            stats = scan(log, since, [d for d, _ in cams])
+        except OSError as e:
+            print(f"compare_cameras: {e}", file=sys.stderr)
+            continue
         for dev, label in cams:
             s = stats[dev]
             kinds = Counter(t for t, _ in s["tracks"])
@@ -94,6 +96,7 @@ def main():
             plates = ",".join(sorted(s["plates"])) or "-"
             lines.append(f"{now:%Y-%m-%d %H:%M} {label:<8} objects {objs} | plates {plates} | "
                          f"{frames} | trouble {s['trouble']}")
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "a") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))

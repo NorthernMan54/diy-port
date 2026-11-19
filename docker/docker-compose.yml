@@ -51,6 +51,10 @@ services:
 networks:
   aiport:
     driver: bridge
+    # Protect's discovery scan only looks at interfaces named br<N> (br-<hash> is
+    # filtered out), so name the host bridge br1 or another free br<N>.
+    driver_opts:
+      com.docker.network.bridge.name: ${AIPORT_BRIDGE_NAME:-br1}
     ipam:
       config:
         - subnet: ${AIPORT_SUBNET:-172.30.10.0/24}

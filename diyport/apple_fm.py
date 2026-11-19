@@ -148,7 +148,7 @@ class VehicleClassifier:
 
     def _stop(self):
         """Close stdin (the helper exits on EOF and sudo reaps it), then signal its own
-        session. Live 2026-11-11 on Flynn: five `sudo -u ... vehicle_attrs` wrappers, one per
+        session. Live 2026-11-11 on a macOS host: five `sudo -u ... vehicle_attrs` wrappers, one per
         restart back to 6 days, each holding a zombie helper. The service's SIGINT to diy-port's
         process group reached sudo, which then never reaped its child; and kill() here
         SIGKILLed sudo, orphaning the helper. Its own session keeps group signals off it."""

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 The DIY-Port project
 """Shared decode for transcoded ONVIF cameras (AIPORT_ONVIF_SHARED_DECODE): detection decodes
 the video1 that onvif_push sends Protect, read from its DetectServer socket, instead of
 pulling the camera a second time. Each analysed frame takes the wall time the push gave
@@ -11,13 +12,13 @@ import time
 
 import onvif_push
 
-log = logging.getLogger("diyport.avclient")
+log = logging.getLogger("aiport-avclient")
 
 
 def keep_ratio(fps, detect_fps):
     """(keep, of): analyse `keep` of every `of` pushed frames, spread evenly. A whole
     stride (every Kth frame) can't hit detect_fps from 15 fps: live 2026-11-07 on
-    92DE633106E8 (15 fps) round(15/10) = 2 gave 7.5 fps and a "falling behind" warning
+    a 15 fps camera, round(15/10) = 2 gave 7.5 fps and a "falling behind" warning
     every minute. Integers, so ffmpeg's select and the wall-time feeder agree exactly."""
     of = max(1, int(round(float(fps))))
     return min(detect_fps, of), of

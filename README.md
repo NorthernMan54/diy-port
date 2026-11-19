@@ -1,4 +1,4 @@
-# diy-port - a DIY UniFi Protect "AI Port" (Orange Pi · Raspberry Pi · x86 · Mac)
+# diy-port: a DIY UniFi Protect AI Port for Orange Pi, Raspberry Pi, x86 and Mac
 
 <div align="center">
 
@@ -234,9 +234,10 @@ sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
   `--rknn-url` / `DIYPORT_RKNN_URL` / its default URL. `--rknn <path>` takes a
   local build, and a local `models-rknn/` copy (e.g. a checkout of
   `hutchx86/pi-port-models`) is also detected.
-- Opens the web UI on `:8090` (`--webui-port` to change) for board stats and
-  instance management. Instance create/destroy is localhost-only by default;
-  set `AIPORT_WEBUI_ALLOW_REMOTE=1` in the unit to allow it from the LAN.
+- Opens the web UI on `127.0.0.1:8090` by default (`--webui-port` and
+  `--webui-bind` to change) for board stats and instance management. Use
+  `--webui-bind 0.0.0.0` to expose it on the LAN; it has no auth. Instance
+  create/destroy is localhost-only unless `AIPORT_WEBUI_ALLOW_REMOTE=1` is set.
 
 Then, in Protect: adopt "AI Port" like any camera, and pair a real camera to it
 from the camera's own settings page. Detections appear as dashboard events with
@@ -378,7 +379,7 @@ venv/bin/pip install "fast-alpr[onnx]" opencv-python-headless   # optional: plat
 venv/bin/python scripts/fetch_models.py --backend cpu      # downloads yolov5n.onnx
 venv/bin/python scripts/fetch_models.py --face-models-only # optional: YuNet/SFace face models
 $EDITOR diyport/aiport.cfg                                   # set [console] host + device_id
-caffeinate -is venv/bin/python diyport/run_all.py --iface en0 --state-dir ~/.diyport-state
+caffeinate -is venv/bin/python diyport/run_all.py --iface en0 --state-dir ~/.diy-port/native/state
 ```
 
 No sudo is needed on macOS: since 10.14 a normal user can bind ports below 1024. Running it
@@ -386,7 +387,8 @@ with sudo leaves the state dir and log root-owned, and the launchd agent then re
 
 To run it as a service instead, install the launchd agent (no sudo):
 `scripts/macos_launchd.sh install` starts it at login, restarts it on exit, and re-reads
-`~/.diyport.env` on `touch ~/.diyport-restart`; logs rotate in `~/diyport.log`.
+the instance's `diyport.env` on touching its `restart` file; logs rotate in its
+`logs/diyport.log`. The defaults are under `~/.diy-port/native/`; see `scripts/diyport_paths.sh`.
 `scripts/diyport_service.sh` does the work and can also run in a terminal. See `diyport/README.md`.
 
 - `caffeinate -is` stops the Mac sleeping while it runs (a sleeping Mac drops off the console).
@@ -408,6 +410,11 @@ networking clashes on `:443` and a macvlan interface cannot talk to its own
 host. `docker/docker-compose.yml` instead puts the AI Port on a private bridge
 network: it gets its own `:443`, and host ↔ container traffic is routed without
 NAT, so the console reaches it at `AIPORT_IP`.
+
+The supported setup is a console with host networking. A macvlan console cannot
+reach the Docker subnet, and a bridge-network console does not scan this bridge.
+Protect also scans only host interfaces named `br<N>`, so the stack names its
+bridge `AIPORT_BRIDGE_NAME` (default `br1`), not Docker's usual `br-<hash>`.
 
 ```bash
 cd docker
@@ -456,16 +463,18 @@ per-camera exceptions by device ID (MAC), such as `isolated,AABBCCDDEEFF=copy`.
 | Mode | What it does | Pushes run in | Camera sessions | Sizes sent to Protect |
 |---|---|---|---|---|
 | `copy` (default) | `ffmpeg` copies the camera's main stream and substream | `avclient.py` | 3, with detection | The camera's own |
-| `transcode` | One `gst-launch` decodes the main stream once and encodes each channel with VideoToolbox, as the real AI Port does | `avclient.py` | 2, with detection | `video1` main size at 4000 kbps, `video2` substream size at 2000 kbps, `video3` 360 lines at 500 kbps |
-| `isolated` | As `transcode` | A process per camera | 2, with detection | As `transcode` |
+| `transcode` | One `gst-launch` decodes the main stream once and encodes each channel with VideoToolbox, as the real AI Port does | `avclient.py` | 1 (2 with `AIPORT_ONVIF_SHARED_DECODE=0`) | `video1` main size at 4000 kbps, `video2` substream size at 2000 kbps, `video3` 360 lines at 500 kbps |
+| `isolated` | As `transcode` | A process per camera | 1 (2 with `AIPORT_ONVIF_SHARED_DECODE=0`) | As `transcode` |
 
 `transcode` and `isolated` need macOS and `brew install gstreamer`. On an M1 Pro a transcoded
-camera used about 11% of one core and up to about 290 MB, against about 1% and 11 MB for
+camera used about 11% of one core and up to about 290 MB, against about 1% and 11-22 MB for
 `copy`. On a machine without them, the camera logs an error and uses `copy`.
 
-In `isolated`, a crash in the push costs that camera's video for a few seconds and leaves
-detection running, and the process is replaced. It doesn't help the other way round: if
-detection's process dies, the push stops with it.
+In `isolated`, a crash in the push costs that camera's video for a few seconds and the
+process is replaced. With shared decode on (the default) detection reads the video1 that
+process pushes, so detection also pauses until the replacement starts; with
+`AIPORT_ONVIF_SHARED_DECODE=0` detection keeps its own pull. It doesn't help the other way
+round: if detection's process dies, the push stops with it.
 
 Protect doesn't always tell diy-port it was removed: it just closes each connection without
 a message. An adopted instance logs `was this AI Port removed in Protect?` once this has
@@ -482,6 +491,11 @@ channel has been silent for 5 s. In every mode, the log warns
 
 `AIPORT_ONVIF_AUDIO_OFF` (empty or `0` for none, `1` for all, or a list of device IDs) is an experiment: the listed cameras' replies tell
 Protect audio is off, while their pushes keep the audio track.
+
+`AIPORT_ONVIF_CAMERA_TIMESTAMPS` (same list format) keeps the listed cameras' own frame
+timestamps on the copy pull instead of stamping each frame when it arrives. Arrival stamps
+(the default) pass network and RTSP-over-TCP jitter into the video Protect plays; use camera
+timestamps for a camera or restream whose timestamps are regular.
 
 If the camera's ONVIF profiles can't be read, diy-port tries again: twice within a few
 seconds, then every 30 s, 2 minutes and 10 minutes. Until it succeeds, `video2` and
@@ -505,7 +519,7 @@ ECI-T24F2, was set up as follows:
 | Frame Rate | 20 fps | 20 fps |
 | Max. Bit Rate | 3072 kbps | 2048 kbps |
 | Video Encoding | H.264 | H.264 |
-| H.264+ | Off | – |
+| H.264+ | Off | - |
 | Profile | Medium | Medium |
 | I-Frame Interval | 20 (1 s) | 20 (1 s) |
 | Smoothing | 50 | 25 |
@@ -666,20 +680,19 @@ CPU); `cpu` forces CPU and `coreml` requests Core ML (CPU with a warning if abse
   faces; faces are matched against Protect's known-faces DB (`UpdateFaceDBRequest`), but
   the attribute and plate field mapping is a **best-guess wire format** not confirmed
   against a real AI Port capture.
-- **Gap: no motion events for paired cameras.** While a camera is paired, Protect
-  ignores the camera's own motion events (`EventSmartMotion`/`EventAnalytics`) and
-  takes them from the AI Port, but diy-port doesn't send any yet. Paired cameras show
-  no motion-only events, motion-triggered recording only follows smart detections,
-  and motion alerts don't fire. diy-port already runs a motion detector on every
-  frame; the missing piece is the exact `EventSmartMotion` start/pulse/stop payload
-  Protect expects. See `docs/protect-aiport-controller.md`.
+- **Known:** paired cameras get ordinary motion events from diy-port
+  (`EventSmartMotion` start/stop, timed by Protect's `ChangeSmartMotionSettings`), not
+  from the camera whose own events Protect drops. diy-port sends no heatmap or pulses,
+  so motion events reach Protect but the live "detected motion" overlay has nothing to
+  draw. See `docs/protect-aiport-controller.md`.
 - **Gap: no audio detection for paired cameras.** Protect also drops a paired camera's
   own `EventSmartAudio` (smoke/CO alarm, glass break, etc.), and diy-port's feature
   flags list no audio types, so those detections are turned off while the camera is
   paired.
 - **Known:** an assigned ONVIF camera depends on the AI Port for its video (no
-  recording while the AI Port is down), gets the main stream on every channel,
-  and AAC instead of Opus audio.
+  recording while the AI Port is down). video1 carries the main stream and
+  video2/video3 the camera's substream; audio is copied (G.711, AAC or MP3) or
+  re-encoded to AAC when FLV cannot carry it. Opus is not pushed.
 - **Known:** in the same-host Docker setup the AI Port is only reachable from
   its own host, so it only suits a console running on that host.
 - **Known:** on the Raspberry Pi 4 the H.264 hardware decoder is instance-limited
@@ -692,36 +705,7 @@ CPU); `cpu` forces CPU and `coreml` requests Core ML (CPU with a warning if abse
   untested. Docker Desktop can't provide the L2 device the console expects.
 - **Planned:** stress-testing beyond the four-camera live setup.
 
-## Changelog
-
-<details>
-<summary><b>Changelog</b></summary>
-
-- **2026-10-29** - PR #4 (NorthernMan54): Frigate-style detection (motion gate,
-  region crops, true-positive gating, parked objects, optional Norfair), optional
-  enrichment (plates, faces against Protect's face DB, vehicle attributes incl.
-  Apple's model on macOS), one event per camera with batched leaves and real zone
-  ids, per-camera box timing, stream recovery/backoff, replay harness, per-camera
-  frames and host load lines, macOS launchd service. Fixes: track timers follow
-  the analysed-frame rate, and the auto-hwdec tests pass on an RK3588 host.
-- **Unreleased** - pluggable detector backends (`diyport/detectors/`): RK3588
-  NPU, Coral Edge TPU (Raspberry Pi 5) and CPU/Core ML, chosen by `[hardware]
-  detector` / `install.sh --accel`; ONVIF cameras (video push to Protect plus
-  detection); a Docker bridge setup for a console on the same host; credentials
-  masked in logs; macOS bare-metal support (Core ML on Apple silicon); CPU
-  Docker image + Komodo stack (x86_64 / arm64); Pi 4 hardware-decode + detector
-  tuning; hardened HTTPS API (per-connection TLS, request limits), supervised
-  `run_all.py`, drained ffmpeg stderr, real per-zone IDs, localhost-only web
-  instance management, and persistent `/data` state in the LAN Compose stacks.
-- **2026-10** - firmware-update faking; optional sysinfo web UI; Pi 4 hardware
-  decode and detector tuning; Docker CPU image/Komodo stack.
-- **2026-09** - Line Crossing; paired-camera snapshot retrieval over UCP4; the
-  `connectionHost` upload fix; event/feature-flag dedupe; multi-instance systemd
-  units; one-shot `install.sh`.
-- **2026-08** - initial protocol stack: discovery, adoption, both WebSocket
-  connections, NPU detection and `EventSmartDetect` with thumbnails.
-
-</details>
+Release history: [docs/changelog.md](docs/changelog.md).
 
 ## Troubleshooting
 
@@ -800,12 +784,14 @@ not responsible or liable for any loss or damage arising from its use.**
 
 ## Security
 
-Report vulnerabilities privately via GitHub Security Advisories. Runtime state -
-the adoption token and the mTLS client certificate/key - is written to the
-instance state directory (`--state-dir`) and excluded by `.gitignore`; never
-commit it. No secrets are stored in this repository. Logged payloads are passed
-through a redaction filter for camera RTSP credentials, the console's login
-password and adoption tokens.
+See [SECURITY.md](SECURITY.md) for the trusted-LAN boundary. Report
+vulnerabilities privately via GitHub Security Advisories. Runtime state -
+the adoption token and the mTLS client certificate/key - belongs in the instance
+state directory passed as `--state-dir`; the service and launchd installers
+always pass one. A manual run defaults to `$XDG_STATE_HOME/diyport` (or
+`~/.local/state/diyport`); on first start `run_all.py` copies any old
+repo-local state there. No secrets are stored in this repository. Logged payloads are passed through a redaction filter for camera
+RTSP credentials, the console's login password and adoption tokens.
 
 ## License
 
