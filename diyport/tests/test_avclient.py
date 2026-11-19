@@ -310,6 +310,21 @@ class TestZoneFiltering(Base):
         self.assertTrue(av._is_outside_detect_zones("Z", in_other, "licensePlate"))
         self.assertFalse(av._is_outside_detect_zones("Z", in_other))  # no type: any zone
 
+    def test_box_cut_off_by_the_bottom_edge_is_in_a_full_frame_zone(self):
+        # Live 2026-11-19 07:25: a person at an intercom (feet out of frame, score 0.89)
+        # stayed "outside the zones for its type" of a full-frame zone and was never reported.
+        full = [(0, 0), (1000, 0), (1000, 1000), (0, 1000)]
+        av._detect_zones["F"] = [full]
+        av._detect_zone_types["F"] = [["person", "face"]]
+        av._detect_zone_ids["F"] = [1]
+        bottom = [300, 400, 200, 600]                       # y + h == 1000
+        self.assertEqual(av._zones_of("F", bottom, "person"), [1])
+        self.assertFalse(av._is_outside_detect_zones("F", bottom, "person"))
+        self.assertTrue(av._is_outside_detect_zones("F", bottom, "vehicle"))
+        # A zone that stops short of the bottom still doesn't reach the cut-off feet.
+        av._detect_zones["F"] = [[(0, 0), (1000, 0), (1000, 900), (0, 900)]]
+        self.assertEqual(av._zones_of("F", bottom, "person"), [])
+
     def test_zone_without_ids_still_matches(self):
         # Replay sets zones/types but no ids; a short id table must not drop polygons.
         av._detect_zones["Q"] = [SQUARE]

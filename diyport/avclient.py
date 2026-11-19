@@ -939,13 +939,20 @@ def _protect_center(device_id, coord):
     return _zone_center_norm(_to_protect(device_id, coord))
 
 
+# Half a unit of Protect's 0-1000 grid: inside any zone drawn to the frame's bottom edge.
+FOOT_EDGE_INSET = 0.5
+
+
 def _protect_foot(device_id, coord):
     """Bottom-centre of the box in Protect's canvas space: where the object stands, which
     zones are tested against (as in Frigate). Line crossing keeps using the centre. Seen
     live: a person walking along Camera C's hedge had their box centre near the edge of
     zone 2 while their feet were well inside it."""
     x, y, w, h = _to_protect(device_id, coord)
-    return x + w / 2.0, y + h
+    # A box cut off by the frame's bottom (someone close to the camera) ends at exactly
+    # CAMERA_COORD_END, on the edge of a zone drawn to the bottom, which the ray-casting
+    # test counts as outside -- even for a full-frame zone. Keep the point just inside.
+    return x + w / 2.0, min(y + h, CAMERA_COORD_END - FOOT_EDGE_INSET)
 
 
 def _is_excluded(device_id, coord):
