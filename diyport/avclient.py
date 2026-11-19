@@ -3869,15 +3869,15 @@ def _describe_face_db(path):
 
 
 def _face_db_uri_ok(uri, device_info):
-    """Only the console's HTTPS host may receive the client cert and device headers."""
+    """Only the console's HTTPS host may receive the client cert and device headers. A query
+    is allowed: Protect's URI always carries one (/internal/face-db/latest?type=known&mac=...)."""
     try:
         parts = urlsplit(uri)
     except (TypeError, ValueError):
         return False
     want = str(device_info.get("console_host") or "").strip().lower()
     return bool(want and parts.scheme == "https" and (parts.hostname or "").lower() == want
-                and not parts.username and not parts.password
-                and not parts.query and not parts.fragment)
+                and not parts.username and not parts.password and not parts.fragment)
 
 
 def _download_face_db(uri, device_info):

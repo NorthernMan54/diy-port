@@ -102,8 +102,12 @@ class TestFaceDbURI(unittest.TestCase):
     def test_only_the_console_https_host_is_accepted(self):
         info = {"console_host": "192.0.2.1"}
         self.assertTrue(av._face_db_uri_ok("https://192.0.2.1:7444/db", info))
+        # Protect 7.4's UpdateFaceDBRequest always has a query; refusing it meant no face DB.
+        self.assertTrue(av._face_db_uri_ok(
+            "https://192.0.2.1:7444/internal/face-db/latest?type=known&mac=FCECDA000001", info))
         for bad in ("http://192.0.2.1/db", "https://198.51.100.9/db",
-                    "https://user@192.0.2.1/db", "https://192.0.2.1/db?x=1"):
+                    "https://user@192.0.2.1/db", "https://192.0.2.1/db#x",
+                    "https://198.51.100.9/db?host=192.0.2.1"):
             self.assertFalse(av._face_db_uri_ok(bad, info), bad)
 
 
