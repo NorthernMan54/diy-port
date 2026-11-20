@@ -135,6 +135,38 @@ class TestGoMode(unittest.TestCase):
             self._configure(m, **params)
             self.assertTrue(wait(lambda: last_opus() == want), (params, last_opus()))
 
+    def test_re_send_bumps_request_without_replacing_the_push(self):
+        """Live 2026-11-19 on Flynn: after bbc6af1's reconnect-in-place, a re-send raised
+        AttributeError (GoPush had no reconnect) and closed the avclient WS. A re-send must
+        keep the push and re-send the camera with a new request, so the sidecar un-parks a
+        push Protect had rejected."""
+        fake = FakeSidecar(self.path)
+        client = onvif_push.RestreamerClient(self.path, retry_s=(0.05,))
+        self.addCleanup(client.close)
+        m = self._manager(client)
+        self._push(m)
+        self.assertTrue(wait(lambda: fake.requests))
+        push = m._pushes[("CAM", "video1")]
+        first = fake.requests[-1]["params"]["channels"][0]["request"]
+        self._push(m)                               # Protect re-sent the same settings
+        self.assertIs(m._pushes[("CAM", "video1")], push)
+        self.assertTrue(wait(lambda: fake.requests[-1]["params"]["channels"][0]["request"]
+                             > first))
+        self.assertEqual(fake.requests[-1]["method"], "configure_camera")
+
+    def test_re_send_survives_a_failing_push(self):
+        """One push failing its reconnect is logged, not raised into the WS handler."""
+        client = mock.Mock()
+        client.last_sent.return_value = None       # no frame from the sidecar yet
+        m = self._manager(client)
+        self._push(m)
+        push = m._pushes[("CAM", "video1")]
+        with mock.patch.object(push, "reconnect", side_effect=RuntimeError("boom")), \
+                self.assertLogs("aiport-onvif", "ERROR") as logs:
+            self._push(m)                           # must not raise
+        self.assertIn("re-send reconnect failed", "\n".join(logs.output))
+        self.assertIs(m._pushes[("CAM", "video1")], push)
+
     def test_gopush_matches_includes_opus(self):
         push = onvif_push.GoPush("CAM", "video1", URL, "S1", "tcp://192.168.1.1:7550", True, {},
                                  None, (True, 24000))

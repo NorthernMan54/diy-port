@@ -2766,6 +2766,26 @@ class TestMotionLoopLifecycle(Base):
         self.assertEqual(self.ticks, ["D", "D"])   # a new frame is analysed
         av._stop_motion_detector("D")
 
+    def test_closed_ws_logs_once_not_per_frame(self):
+        # Live 2026-11-19 on Flynn: after a 1011 close, ~100 EventSmartMotion sends each
+        # logged a traceback. A closed WS is one warning per loop, not one per frame.
+        from websockets.exceptions import ConnectionClosedError
+
+        def closed(ws, dev):
+            self.ticks.append(dev)
+            raise ConnectionClosedError(None, None)
+        av._motion_tick = closed
+        with self.assertLogs(av.log, "WARNING") as logs:
+            av._start_motion_detector(None, "D")
+            for n in range(5):
+                av._latest_frame_time["D"] = (n, n)
+                time.sleep(0.05)
+            av._stop_motion_detector("D")
+        self.assertGreater(len(self.ticks), 1)
+        lines = [l for l in logs.output if "connection closed" in l]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertFalse([l for l in logs.output if "crashed" in l], logs.output)
+
     def test_restart_does_not_leave_overlapping_loops(self):
         # A stream restart calls _start_motion_detector again; the previous loop
         # must be stopped AND joined, or both mutate the same track state.

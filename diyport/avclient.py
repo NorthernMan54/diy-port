@@ -38,6 +38,7 @@ import requests
 import urllib3
 
 import facedb
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -3486,6 +3487,7 @@ def _start_motion_detector(ws, device_id, preserve_tracks=False):
 
     def _poll_loop():
         last_stamp = None
+        closed_noted = False  # this loop's WS closed and was logged once
         while not stop_event.is_set():
             # Wake on each new frame; with no stream the DETECT_INTERVAL_S timeout still
             # ticks so tracks close.
@@ -3510,6 +3512,15 @@ def _start_motion_detector(ws, device_id, preserve_tracks=False):
             started = time.monotonic()
             try:
                 _motion_tick(ws, device_id)
+            except ConnectionClosed as e:
+                # The avclient WS this loop holds has closed; the stream restart that follows
+                # a reconnect supersedes this loop with one on the new WS.
+                # Live 2026-11-19 on Flynn: ~100 tracebacks from EventSmartMotion sends after
+                # a 1011 close. Say it once per loop, not once per frame.
+                if not closed_noted:
+                    closed_noted = True
+                    log.warning("deviceID=%s: avclient connection closed (%s); events wait "
+                                "for the reconnect", device_id, e)
             except Exception:
                 log.exception("motion poll tick crashed for deviceID=%s", device_id)
             _last_analysed[device_id] = time.monotonic()

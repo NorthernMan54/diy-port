@@ -1797,6 +1797,15 @@ class GoPush:
         log.info("push %s/%s: %s (go: the sidecar reconnects itself)", self.device_id,
                  self.channel, reason)
 
+    def reconnect(self, reason):
+        """A re-send is a fresh request: a new `request` un-parks a push Protect had rejected
+        (rpc.Channel.Request); nothing else restarts. Before bbc6af1's reconnect-in-place this
+        came from building a new GoPush per re-send. Live 2026-11-19 on Flynn: without this,
+        go mode raised AttributeError here, which closed the avclient WS (1011) on every
+        re-send, 11 times in 75 s on every camera."""
+        self.request = next(_GO_REQUESTS)
+        self._client.configure(self.device_id, self._params())
+
     def stop(self):
         if self._group.get(self.channel) is self:
             del self._group[self.channel]
@@ -2038,8 +2047,14 @@ class PushManager:
                         >= RECONNECT_MIN_S:
                     self._reconnected[key] = now
                     push = self._pushes[key]
-                    push.restart_source("Protect re-sent its settings")
-                    push.reconnect("Protect re-sent its settings")
+                    # One push failing here must not escape into the WS message handler:
+                    # that ends the avclient connection, and Protect's re-send on reconnect
+                    # fails the same way (live 2026-11-19 on Flynn, go mode).
+                    try:
+                        push.restart_source("Protect re-sent its settings")
+                        push.reconnect("Protect re-sent its settings")
+                    except Exception:
+                        log.exception("push %s/%s: re-send reconnect failed", device_id, channel)
                     # Keep its last write, or a channel Protect keeps re-sending would
                     # look healthy however long it has delivered nothing.
                     self._last_sent[key] = push.last_sent
