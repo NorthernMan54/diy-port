@@ -67,7 +67,8 @@ is in [docs/motion-audio-findings.md](docs/motion-audio-findings.md). "Olli" is
   in `ChangeSmartDetectSettings`, and diy-port reads none of them:
   - Per zone: `sensitivity` (50 seen).
   - Per camera: `minPresenceProbability` 40, `maxPresenceProbability` 80,
-    `reVerificationPolicy {person: {enable}}`, `recognitionAccuracy {face: auto}`,
+    `recognitionAccuracy {face: auto}`,
+    (`reVerificationPolicy` is handled since 2026-11-20: it sets `reVerifyEligible`),
     `enableTamperDetection`.
   - Our thresholds are env-only (`AIPORT_TRUE_THRESH`, `AIPORT_FACE_THRESH`), so Protect's
     sliders do nothing. Map zone sensitivity and the presence probabilities onto confirm
