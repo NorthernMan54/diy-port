@@ -1037,6 +1037,16 @@ class TestCameraEvent(Base):
         tr["embed_reads"], tr["extra"]["matchedId"] = 2, 186
         self.assertIn("faceEmbed", av._track_args(1, tr)["descriptor_extra"])   # named
 
+    def test_face_embed_goes_out_unit_length(self):
+        # A real AI Port's faceEmbed has length 1 (live 2026-11-21); raw SFace is ~8, and
+        # Protect's face service compares by dot product.
+        tr = {"objectType": "face", "score": 0.9, "coord": [0, 0, 1, 1], "first_shown_ms": 0,
+              "extra": {"faceEmbed": [3.0, 4.0], "matchedId": 186}, "embed_reads": 2}
+        self.assertEqual(av._track_args(1, tr)["descriptor_extra"]["faceEmbed"], [0.6, 0.8])
+        self.assertEqual(tr["extra"]["faceEmbed"], [3.0, 4.0])   # the track keeps the raw one
+        self.assertEqual(av._unit_embed([0.0, 0.0]), [0.0, 0.0])
+        self.assertIsNone(av._unit_embed(None))
+
     def test_named_face_sends_its_embedding_at_once(self):
         tr = {"objectType": "face", "score": 0.9, "coord": [0, 0, 1, 1], "first_shown_ms": 0,
               "extra": {"faceEmbed": [0.1], "matchedId": 5}}
@@ -2001,7 +2011,8 @@ class TestMultiLeave(Base):
             self.assertEqual(self.sent[-1][1]["descriptors"], [])
         attrs = payload["trackerIDAttrMap"]
         self.assertEqual(attrs["3"]["associatedFaceTrackerID"], 4)
-        self.assertEqual(attrs["4"]["faceEmbed"], [0.1, 0.2])
+        # Sent L2-normalised, as a real AI Port's faceEmbed is.
+        self.assertEqual(attrs["4"]["faceEmbed"], [0.447214, 0.894427])
         self.assertEqual(attrs["1"]["matchedName"], "ABC123")
         self.assertEqual(attrs["1"]["vehicleType"], {"val": "truck", "confidence": 70})
         self.assertEqual(attrs["1"]["color"]["val"], "white")

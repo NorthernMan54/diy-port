@@ -29,7 +29,9 @@ ITEM_DIM = 512
 NODE = 16 + 4 * ITEM_DIM      # Annoy dot-product node: n_descendants, children[2], dot factor, v
 HEADER = 16
 BLOCKS = (0, 132, 264)        # float offsets of the embeddings in an item
-NORM_RANGE = (1.0, 100.0)     # SFace features are unnormalised, ~5-20
+# Raw SFace features are ~5-20; faceEmbed has been sent unit length since 2026-11-21, like a
+# real AI Port's, so enrolments from then on are 1.0. Unused memory is caught by the checks above.
+NORM_RANGE = (0.5, 100.0)
 
 
 def _embedding(block):

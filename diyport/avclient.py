@@ -2374,6 +2374,17 @@ FACE_RESUME_MIN_SIM = 0.3
 FACE_RESUME_MAX_DIST_FACTOR = 2.0  # old face size, when the new read has no embedding
 
 
+def _unit_embed(v):
+    """faceEmbed as Protect gets it: L2-normalised. A real AI Port's faceEmbed has length
+    1.000 (live, 2026-11-21); raw SFace is about 7-9, and Protect's face service compares by
+    dot product, so raw vectors scored far past its threshold and matched the wrong people.
+    Internal checks (weak-face gate, facedb, track similarity) keep the raw vector."""
+    if not v:
+        return v
+    n = math.sqrt(sum(x * x for x in v))
+    return [round(x / n, 6) for x in v] if n else v
+
+
 def _face_similarity(a, b):
     """Cosine similarity of two embeddings, or None without both."""
     if not a or not b:
@@ -2493,6 +2504,8 @@ def _track_args(tracker_id, tr, hold_embed=True):
             or (not hold_embed and extra.get("matchedId") is not None)):
         # held until decided; and a named face's leave carries its match, not its embedding
         extra = {k: v for k, v in extra.items() if k != "faceEmbed"}
+    if tr["objectType"] == "face" and extra and extra.get("faceEmbed"):
+        extra = dict(extra, faceEmbed=_unit_embed(extra["faceEmbed"]))
     if tr["objectType"] == "vehicle" and extra is not None:
         extra = dict(extra, attributes=_vehicle_attrs(tr, leaving=not hold_embed))
     return {"tracker_id": tracker_id, "object_type": tr["objectType"],
@@ -2714,7 +2727,7 @@ def _tracker_attrs(tracker_id, tr, faces_by_person):
     # embedding into a new unknown group and lost the name.
     if (tr["objectType"] == "face" and extra.get("faceEmbed")
             and extra.get("matchedId") is None):
-        entry["faceEmbed"] = extra["faceEmbed"]
+        entry["faceEmbed"] = _unit_embed(extra["faceEmbed"])
     if tr["objectType"] == "person" and tracker_id in faces_by_person:
         entry["associatedFaceTrackerID"] = faces_by_person[tracker_id]
     if tr["objectType"] in ("face", "person") and extra.get("matchedId") is not None:

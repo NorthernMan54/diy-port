@@ -101,6 +101,14 @@ class TestParse(unittest.TestCase):
         self.assertEqual([i for i, *_ in db.instances], [0, 0, 1])
         np.testing.assert_allclose(db.instances[1][3], b, rtol=1e-6)
 
+    def test_unit_length_enrolment_is_read(self):
+        # faceEmbed goes out L2-normalised since 2026-11-21, like a real AI Port's, so new
+        # enrolments have length 1.0 (float32 can land just under it).
+        u = vec()
+        u = (u / np.linalg.norm(u) * 0.9999996).astype(np.float32)
+        db = facedb.parse(build({5: ("Ian", [u])}, items=[item(u, garbage=True)]))
+        self.assertEqual([i for i, *_ in db.instances], [0])
+
     def test_instance_without_an_embedding_is_skipped(self):
         db = facedb.parse(build({5: ("Ian", [vec(), vec()])},
                                 items=[item(garbage=True), item(vec())]))
