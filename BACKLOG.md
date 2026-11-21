@@ -74,6 +74,13 @@ is in [docs/motion-audio-findings.md](docs/motion-audio-findings.md). "Olli" is
     sliders do nothing. Map zone sensitivity and the presence probabilities onto confirm
     thresholds. Find out first how the real AI Port interprets them: firmware strings or a
     capture.
+- **`enableSmartDetect` is ignored** (2026-11-21, hint 2 review). `ChangeSmartDetectSettings`
+  carries the camera's enabled detection types, e.g. `['person', 'vehicle', 'animal',
+  'licensePlate', 'face']`. Protect sends `[]` when the smart-detection agreement isn't
+  accepted, and drops face or licensePlate when that recognition is off in Protect.
+  diy-port only filters on each zone's `objectTypes`, so it keeps sending types the camera
+  has turned off. Fix: store it per deviceID (keep it across partial updates, clear it on
+  `ResetToDefaults`), and only report types that are in it.
 - **Clock and timestamp text read as a plate** (ONVIF LPR). Hikvision cameras burn in a clock
   and timestamp, and fast-alpr could read them as a plate. Check `face dropped`-style logs
   and plate reads for date-like text. Ignore plate boxes that sit still across frames, or
