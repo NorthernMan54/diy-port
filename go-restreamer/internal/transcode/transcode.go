@@ -506,57 +506,100 @@ func (r *run) once(ctx context.Context) error {
 	go func() { wg.Wait(); waitCh <- cmd.Wait() }()
 
 	kill := func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	var needIDR = true
-	var lastIn time.Time
+	// The feeder owns stdin. A blocking Write here would also block ctx, the stall timer and
+	// waitCh, so Close, configure, stats and SIGTERM would all wait on an ffmpeg that stopped
+	// reading. With the write off this loop, r.in fills instead, push drops to the next IDR,
+	// and the watchdog below kills the wedged ffmpeg.
+	var lastIn, writingSince atomic.Int64 // unix ns; 0: no write yet / not in a write
+	quit := make(chan struct{})
+	feedErr := make(chan error, 1)
+	var feedWG sync.WaitGroup
+	feedWG.Add(1)
+	go func() {
+		defer feedWG.Done()
+		feedErr <- r.feed(stdin, quit, &lastIn, &writingSince)
+	}()
+	stopFeed := func() {
+		close(quit)
+		stdin.Close() // unblocks a Write in progress
+		feedWG.Wait()
+	}
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
-	var buf []byte
 	for {
 		select {
 		case <-ctx.Done():
 			kill()
-			stdin.Close()
+			stopFeed()
 			<-waitCh
 			return nil
 		case err := <-waitCh:
-			stdin.Close()
+			stopFeed()
 			if err == nil {
 				err = io.EOF
 			}
 			return fmt.Errorf("%v: %s", err, stderr.String())
+		case err := <-feedErr:
+			// ffmpeg is gone; report why once it has exited.
+			kill()
+			stopFeed()
+			<-waitCh
+			return fmt.Errorf("stdin: %v: %s", err, stderr.String())
 		case <-tick.C:
-			if !lastIn.IsZero() && time.Since(lastIn) < 5*time.Second &&
-				time.Since(time.Unix(0, lastOut.Load())) > stallAfter {
+			now := time.Now()
+			if ws := writingSince.Load(); ws != 0 && now.Sub(time.Unix(0, ws)) > stallAfter {
+				t.log.Warn("transcode: ffmpeg stopped reading its input, killing it")
+				kill()
+			} else if li := lastIn.Load(); li != 0 && now.Sub(time.Unix(0, li)) < 5*time.Second &&
+				now.Sub(time.Unix(0, lastOut.Load())) > stallAfter {
 				t.log.Warn("transcode: ffmpeg produced no output, killing it")
 				kill()
 			}
-		case au := <-r.in:
-			if needIDR && !au.IDR {
-				continue
+		}
+	}
+}
+
+// feed writes queued AUs to ffmpeg's stdin until quit closes or a write fails.
+func (r *run) feed(stdin io.Writer, quit <-chan struct{}, lastIn, writingSince *atomic.Int64) error {
+	needIDR := true
+	var buf []byte
+	for {
+		var au media.VideoAU
+		select {
+		case <-quit:
+			return nil
+		case au = <-r.in:
+		}
+		if needIDR && !au.IDR {
+			continue
+		}
+		needIDR = false
+		s := r.source()
+		buf = buf[:0]
+		if au.IDR && !hasParamSets(au, s.Video) {
+			buf = annexB(buf, s.VPS, s.SPS, s.PPS)
+		}
+		buf = annexB(buf, au.NALUs...)
+		r.ptsMu.Lock()
+		r.latestIn = au.PTS
+		for i := range r.ptsQ {
+			r.ptsQ[i] = append(r.ptsQ[i], au.PTS)
+			if len(r.ptsQ[i]) > 512 {
+				r.ptsQ[i] = r.ptsQ[i][len(r.ptsQ[i])-256:]
 			}
-			needIDR = false
-			s := r.source()
-			buf = buf[:0]
-			if au.IDR && !hasParamSets(au, s.Video) {
-				buf = annexB(buf, s.VPS, s.SPS, s.PPS)
-			}
-			buf = annexB(buf, au.NALUs...)
-			r.ptsMu.Lock()
-			r.latestIn = au.PTS
-			for i := range r.ptsQ {
-				r.ptsQ[i] = append(r.ptsQ[i], au.PTS)
-				if len(r.ptsQ[i]) > 512 {
-					r.ptsQ[i] = r.ptsQ[i][len(r.ptsQ[i])-256:]
-				}
-			}
-			r.ptsMu.Unlock()
-			lastIn = time.Now()
-			if _, err := stdin.Write(buf); err != nil {
-				// ffmpeg is gone; the waitCh case reports why.
-				kill()
-				<-waitCh
-				stdin.Close()
-				return fmt.Errorf("stdin: %v: %s", err, stderr.String())
+		}
+		r.ptsMu.Unlock()
+		now := time.Now().UnixNano()
+		lastIn.Store(now)
+		writingSince.Store(now)
+		_, err := stdin.Write(buf)
+		writingSince.Store(0)
+		if err != nil {
+			select {
+			case <-quit:
+				return nil // stdin closed under us on the way out
+			default:
+				return err
 			}
 		}
 	}
