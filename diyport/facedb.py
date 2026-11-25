@@ -65,6 +65,16 @@ class FaceDB:
 
     def match(self, embedding, threshold):
         """(subject_id, name, similarity) of the best subject, or None below threshold."""
+        got = self.match_ranked(embedding, threshold)
+        return got[:3] if got else None
+
+    def match_ranked(self, embedding, threshold):
+        """(subject_id, name, top, second) of the best subject, or None below threshold.
+
+        `second` is the best similarity of any other subject (0.0 when there is only one).
+        A small top-second margin means the read cannot tell the two apart; avclient names a
+        face only when the margin clears AIPORT_FACE_DB_MARGIN.
+        """
         if embedding is None or not self.instances:
             return None
         e = np.asarray(embedding, dtype=np.float64).ravel()
@@ -76,10 +86,13 @@ class FaceDB:
         for (_iid, sid, _name, _v), sim in zip(self.instances, sims):
             hits, total, top = per.get(sid, (0, 0, -1.0))
             per[sid] = (hits + (sim >= threshold), total + 1, max(top, float(sim)))
-        sid, (hits, total, top) = max(per.items(), key=lambda kv: (kv[1][0] / kv[1][1], kv[1][2]))
+        ranked = sorted(per.items(), key=lambda kv: (kv[1][0] / kv[1][1], kv[1][2]),
+                        reverse=True)
+        sid, (hits, _total, top) = ranked[0]
         if hits == 0:
             return None
-        return sid, self.subjects[sid], top
+        second = max((v[2] for _sid, v in ranked[1:]), default=0.0)
+        return sid, self.subjects[sid], top, second
 
 
 def parse(tar_bytes):

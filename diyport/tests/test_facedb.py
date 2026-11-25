@@ -158,6 +158,29 @@ class TestMatch(unittest.TestCase):
                                  2: ("One", [near(0.9), near(0.1)])}))
         self.assertEqual(db.match(probe, 0.363)[:2], (1, "Both"))   # 2/2 beats 1/2
 
+    def test_runner_up_is_reported(self):
+        probe = vec()
+
+        def near(sim):
+            other = vec()
+            other -= other @ probe / (probe @ probe) * probe
+            return (sim * probe / np.linalg.norm(probe)
+                    + np.sqrt(1 - sim ** 2) * other / np.linalg.norm(other)) * 10
+
+        db = facedb.parse(build({1: ("Ian", [near(0.483)]), 2: ("Pat", [near(0.452)])}))
+        sid, name, top, second = db.match_ranked(probe, 0.363)
+        self.assertEqual((sid, name), (1, "Ian"))
+        self.assertAlmostEqual(top, 0.483, places=2)
+        self.assertAlmostEqual(second, 0.452, places=2)
+        self.assertAlmostEqual(db.match(probe, 0.363)[2], top, places=5)
+
+    def test_only_one_subject_has_zero_runner_up(self):
+        a = vec()
+        db = facedb.parse(build({5: ("Ian", [a])}))
+        sid, name, top, second = db.match_ranked(a, 0.363)
+        self.assertEqual((sid, name), (5, "Ian"))
+        self.assertEqual(second, 0.0)
+
 
 @unittest.skipIf(av is None, "avclient unavailable")
 class TestAvclientMatching(unittest.TestCase):
@@ -173,6 +196,33 @@ class TestAvclientMatching(unittest.TestCase):
         for subject in ((5, "Ian"), (5, "Ian"), (6, "Pat")):
             av._merge_extra(tr, {"scored": {"match": (subject, 0.5)}}, "D", 3)
         self.assertEqual(tr["extra"]["matchedName"], "Ian")
+
+    def test_close_second_subject_is_not_a_hit(self):
+        tr = {"objectType": "face"}
+        for _ in range(3):
+            av._merge_extra(tr, {"scored": {"match": ((5, "Ian"), 0.483, 0.031)}}, "D", 3)
+        self.assertNotIn("matchedId", tr["extra"])
+        self.assertNotIn("match_streak", tr)
+
+    def test_consecutive_reads_name_the_track(self):
+        tr = {"objectType": "face"}
+        for _ in range(2):
+            av._merge_extra(tr, {"scored": {"match": ((5, "Ian"), 0.6, 0.2)}}, "D", 3)
+        self.assertEqual(tr["extra"]["matchedName"], "Ian")
+
+    def test_alternating_reads_do_not_name(self):
+        tr = {"objectType": "face"}
+        for subject in ((5, "Ian"), (6, "Pat"), (5, "Ian"), (6, "Pat")):
+            av._merge_extra(tr, {"scored": {"match": (subject, 0.6, 0.2)}}, "D", 3)
+        self.assertNotIn("matchedId", tr["extra"])
+
+    def test_named_face_needs_a_longer_streak_to_flip(self):
+        tr = {"objectType": "face", "extra": {"matchedId": 5, "matchedName": "Ian"}}
+        for _ in range(3):
+            av._merge_extra(tr, {"scored": {"match": ((6, "Pat"), 0.7, 0.3)}}, "D", 3)
+        self.assertEqual(tr["extra"]["matchedName"], "Ian")
+        av._merge_extra(tr, {"scored": {"match": ((6, "Pat"), 0.7, 0.3)}}, "D", 3)
+        self.assertEqual(tr["extra"]["matchedName"], "Pat")
 
     def test_attr_map_carries_the_match(self):
         tr = {"objectType": "face", "extra": {"matchedId": 5, "matchedName": "Ian",

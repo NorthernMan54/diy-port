@@ -1732,14 +1732,15 @@ def _enrich_detections(device_id, detections):
                     if f.get("size_px", FACE_EMBED_MIN_PX) >= FACE_EMBED_MIN_PX:
                         face["scored"]["faceEmbed"] = (f["embedding"], f["score"])
                     db = _get_face_db()
-                    m = db.match(f["embedding"], FACE_DB_THRESH) if db else None
+                    m = db.match_ranked(f["embedding"], FACE_DB_THRESH) if db else None
                     if m:
-                        subject_id, name, sim = m
-                        face["scored"]["match"] = ((subject_id, name), sim)
+                        subject_id, name, sim, second = m
+                        face["scored"]["match"] = ((subject_id, name), sim, second)
                         people[f["parent"]].setdefault("scored", {})["match"] = (
-                            (subject_id, name), sim)
+                            (subject_id, name), sim, second)
                         log.info("face DB: face on deviceID=%s matches %r (subject %s, "
-                                 "similarity %.3f)", device_id, name, subject_id, sim)
+                                 "similarity %.3f, margin %.3f)", device_id, name, subject_id,
+                                 sim, sim - second)
                 extra.append(face)
                 if f["name"]:
                     people[f["parent"]].setdefault("extra", {}).update(
@@ -1939,7 +1940,13 @@ def _merge_extra(tr, d, device_id=None, tracker_id=None):
     if d.get("fresh_read") and "faceEmbed" in (d.get("scored") or {}):
         tr["embed_reads"] = tr.get("embed_reads", 0) + 1
     scores = tr.setdefault("extra_scores", {})
-    for key, (value, score) in (d.get("scored") or {}).items():
+    for key, val in (d.get("scored") or {}).items():
+        if key == "match":
+            value, score = val[0], val[1]
+            margin = val[2] if len(val) > 2 else None
+        else:
+            value, score = val
+            margin = None
         if key == "name" and tr.get("objectType") == "vehicle":
             reads = tr.setdefault("plate_reads", [])
             reads.append((value, score))
@@ -1956,15 +1963,25 @@ def _merge_extra(tr, d, device_id=None, tracker_id=None):
                          len(reads))
                 tr["plate_logged"] = text
             out[key], scores[key] = text, conf
-        elif key == "match":  # (subject_id, name) from Protect's face DB
-            hits = tr.setdefault("match_hits", collections.Counter())
-            hits[value] += 1
-            best = max(hits, key=lambda k: hits[k])
-            if hits[best] >= FACE_MATCH_HITS and out.get("matchedId") != best[0]:
-                out["matchedId"], out["matchedName"] = best
+        elif key == "match":  # ((subject_id, name), similarity[, second]) from Protect's DB
+            if margin is not None and margin < FACE_DB_MARGIN:
+                tr.pop("match_streak", None)
+                log.debug("face DB: %s tracker_id=%s deviceID=%s ambiguous %r "
+                          "(similarity %.3f, margin %.3f < %.3f)",
+                          tr.get("objectType"), tracker_id, device_id, value, score,
+                          margin, FACE_DB_MARGIN)
+                continue
+            streak = tr.get("match_streak")
+            streak = (value, streak[1] + 1) if streak and streak[0] == value else (value, 1)
+            tr["match_streak"] = streak
+            needed = FACE_MATCH_HITS
+            if out.get("matchedId") is not None and out["matchedId"] != value[0]:
+                needed *= 2  # a named face needs stronger evidence to flip
+            if streak[1] >= needed and out.get("matchedId") != value[0]:
+                out["matchedId"], out["matchedName"] = value
                 log.info("face DB: %s tracker_id=%s deviceID=%s is %r (subject %s, %d "
-                         "matching read(s))", tr.get("objectType"), tracker_id, device_id,
-                         best[1], best[0], hits[best])
+                         "consecutive read(s))", tr.get("objectType"), tracker_id, device_id,
+                         value[1], value[0], streak[1])
         elif score >= scores.get(key, 0):
             out[key] = value
             scores[key] = score
@@ -2035,11 +2052,10 @@ def _reverify_eligible(device_id, object_type, level):
 
 
 def _reverify_fields(device_id, object_type, level, snapshot_name):
-    """Snapshot fields for Second Stage Verification. Protect's AI daemon ignores
-    reVerifyEligible: it sends a Reverification request only for snapshots with a
-    non-empty reVerificationSnapshotPath (ubnt_ai_daemon ParseEventJSON -> imgPath).
-    Protect never reads the path itself (the AI Key gets an exported clip), so the
-    snapshot's own name is enough."""
+    """Snapshot fields for Second Stage Verification. reVerifyEligible alone is not
+    enough: live, Protect re-checked a snapshot only once it also carried a non-empty
+    reVerificationSnapshotPath. The AI Key is sent an exported clip of the event, so
+    the snapshot's own name serves as the path."""
     if not _reverify_eligible(device_id, object_type, level):
         return {"reVerifyEligible": False}
     return {"reVerifyEligible": True, "reVerificationSnapshotPath": snapshot_name}
@@ -2489,7 +2505,7 @@ def _face_decided(tr):
     if extra.get("matchedId") is not None:
         return True
     reads = tr.get("embed_reads", 0)
-    return reads >= (FACE_EMBED_HOLD_READS if tr.get("match_hits") else FACE_MATCH_HITS)
+    return reads >= (FACE_EMBED_HOLD_READS if tr.get("match_streak") else FACE_MATCH_HITS)
 
 
 def _track_args(tracker_id, tr, hold_embed=True):
@@ -3997,6 +4013,10 @@ def _download_face_db(uri, device_info):
 # DB; a face names a subject after FACE_MATCH_HITS matches at AIPORT_FACE_DB_THRESH.
 FACE_MATCH_HITS = 2
 FACE_DB_THRESH = envutil.env_float("AIPORT_FACE_DB_THRESH", 0.45)
+# A read whose best and second-best subjects are closer than this cannot tell them apart.
+# Live 2026-11-22 on the doorbell: 42 px faces scored 0.483 and 0.452 for two subjects in the
+# same second. 0.05 rejects that pair but keeps a clear 0.60 vs 0.40.
+FACE_DB_MARGIN = envutil.env_float("AIPORT_FACE_DB_MARGIN", 0.05)
 # Smallest face read (shorter side, snapshot px) whose embedding is sent to Protect.
 FACE_EMBED_MIN_PX = envutil.env_int("AIPORT_FACE_EMBED_MIN_PX", 60)
 _face_db = None
