@@ -4,8 +4,11 @@ package transcode
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"diyport/go-restreamer/internal/media"
 )
@@ -113,5 +116,35 @@ func TestProbeNone(t *testing.T) {
 	}
 	if c := Probe("/nonexistent/ffmpeg", "auto"); c.OK() || c.FFmpeg != "" {
 		t.Fatalf("Probe missing = %+v", c)
+	}
+}
+
+// An ffmpeg that stops reading stdin must not hold up Close: the stdin write used to run in
+// the goroutine that watches ctx, so Close waited on a full pipe forever.
+func TestCloseWithFFmpegIgnoringStdin(t *testing.T) {
+	fake := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tc := New(Config{Caps: Caps{FFmpeg: fake, Backend: "test", Encoder: "libx264"},
+		Profiles: []Profile{{Name: "video1"}}})
+	tc.Output("video1", &sink{})
+	tc.OnTracks(media.Tracks{Video: media.H264, SPS: []byte{0x67}, PPS: []byte{0x68}, Width: 64, Height: 64})
+	big := bytes.Repeat([]byte{0x65, 0}, 32<<10) // 64 KiB AUs: a few fill the pipe
+	for i := 0; i < 50; i++ {
+		tc.OnVideo(media.VideoAU{IDR: true, NALUs: [][]byte{big}})
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond) // let the feeder block in Write
+	done := make(chan struct{})
+	start := time.Now()
+	go func() { tc.Close(); close(done) }()
+	select {
+	case <-done:
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("Close took %v", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung behind a blocked stdin write")
 	}
 }
