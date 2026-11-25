@@ -54,6 +54,10 @@ type Manager struct {
 	pool  *rtsp.Pool
 	start time.Time
 
+	// opMu serialises Configure, Remove and Close. mu guards the camera state; it is dropped
+	// while those wait on slow teardown (an RTSP session closing, an encoder or router
+	// stopping), so get_stats never queues behind them.
+	opMu sync.Mutex
 	mu   sync.Mutex
 	cams map[string]*camera
 }
@@ -190,6 +194,8 @@ func (m *Manager) encoder(cam *camera, url string) *audio.Encoder {
 
 // Configure applies the desired state of one camera.
 func (m *Manager) Configure(p rpc.ConfigureParams) (any, error) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	mode := p.Mode
@@ -299,11 +305,15 @@ func (m *Manager) leave(cam *camera, channel, url string) {
 		return
 	}
 	if g.r.del(channel) == 0 {
-		m.pool.Release(url, g.r)
-		g.r.close()
-		g.r.enc.Close()
 		delete(cam.groups, url)
 		delete(cam.encs, url)
+		// Still before any new Acquire (the caller holds opMu), but without mu: the session
+		// teardown can take a moment and get_stats shouldn't wait for it.
+		m.unlocked(func() {
+			m.pool.Release(url, g.r)
+			g.r.close()
+			g.r.enc.Close()
+		})
 	}
 }
 
@@ -365,8 +375,18 @@ func (m *Manager) applyDetect(cam *camera, sd *rpc.SharedDecode) bool {
 	return true
 }
 
+// unlocked runs f with mu released. Callers hold opMu and mu, and nothing that reads state
+// under mu alone (Stats) changes it, so the state f leaves behind is still the caller's.
+func (m *Manager) unlocked(f func()) {
+	m.mu.Unlock()
+	defer m.mu.Lock()
+	f()
+}
+
 // Remove drops a camera and everything it runs.
 func (m *Manager) Remove(deviceID string) (any, error) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cam := m.cams[deviceID]
@@ -394,11 +414,13 @@ func (m *Manager) removeCamera(cam *camera) {
 
 // Close stops every camera.
 func (m *Manager) Close() {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, cam := range m.cams {
-		m.removeCamera(cam)
 		delete(m.cams, id)
+		m.removeCamera(cam)
 	}
 }
 

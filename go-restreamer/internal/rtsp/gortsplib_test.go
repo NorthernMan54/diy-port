@@ -4,6 +4,7 @@ package rtsp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -156,3 +157,36 @@ type trackGrab struct {
 }
 
 func (g *trackGrab) OnTracks(t media.Tracks) { *g.out = t }
+
+// A camera that accepts TCP but never answers DESCRIBE must not hold a release for the 10 s
+// ReadTimeout: cancelling ctx ends the handshake.
+func TestDialerHandshakeHonoursCtx(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // held open, never answered
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- GortsplibDialer(ctx, "rtsp://"+ln.Addr().String()+"/x", nil) }()
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("dialer returned %v after cancel", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dialer ignored ctx during DESCRIBE")
+	}
+}
