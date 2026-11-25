@@ -37,9 +37,16 @@ func GortsplibDialer(ctx context.Context, rawURL string, sink Sink) error {
 		return err
 	}
 	defer c.Close()
+	// Close cancels the client's own context, which ends a dial or request in progress, so a
+	// release doesn't wait out ReadTimeout on an offline camera's DESCRIBE/SETUP/PLAY.
+	stop := context.AfterFunc(ctx, c.Close)
+	defer stop()
 
 	desc, _, err := c.Describe(u)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	s := &session{c: c, sink: sink}
