@@ -3,7 +3,6 @@
 package flv
 
 import (
-	"sync"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
