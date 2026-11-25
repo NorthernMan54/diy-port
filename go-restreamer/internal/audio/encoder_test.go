@@ -207,6 +207,28 @@ func TestOpusEncodeRateInFFmpegArgs(t *testing.T) {
 	}
 }
 
+// Raw G.711 input is probed as little as possible: ffmpeg 7.1's default probe held about
+// 3.2 s of audio back. Other inputs keep the default probe.
+func TestG711InputProbesMinimally(t *testing.T) {
+	for codec, want := range map[media.Codec]bool{media.PCMU: true, media.PCMA: true, media.AAC: false, media.Opus: false} {
+		tc := &transcoder{codec: codec, rate: 8000, chans: 1, out: func(media.AudioFrame) {}}
+		args := tc.args()
+		in := -1
+		probe := false
+		for i, a := range args {
+			if a == "-i" && in < 0 {
+				in = i
+			}
+			if a == "-probesize" && i+1 < len(args) && args[i+1] == "32" && in < 0 {
+				probe = true
+			}
+		}
+		if probe != want {
+			t.Errorf("%v: input -probesize 32 = %v, want %v (%v)", codec, probe, want, args)
+		}
+	}
+}
+
 func TestSharedEncoderOneFFmpegPerOpusRate(t *testing.T) {
 	if !ffmpegAvailable("") || !opusEncoderAvailable(ffmpegPath("")) {
 		t.Skip("no ffmpeg with libopus")

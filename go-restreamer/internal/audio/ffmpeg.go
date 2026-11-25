@@ -85,11 +85,15 @@ func (tc *transcoder) close() {
 
 func (tc *transcoder) args() []string {
 	a := []string{"-nostdin", "-loglevel", "error"}
+	// Raw G.711 has nothing to probe, but ffmpeg 7.1 still reads about 3.2 s of it before
+	// decoding (first AAC out after 3,200 ms of input; with -probesize 32, after 140 ms).
+	// The format, rate and channels are all given, so probe as little as allowed.
+	g711 := []string{"-probesize", "32", "-analyzeduration", "0"}
 	switch tc.codec {
 	case media.PCMU:
-		a = append(a, "-f", "mulaw", "-ar", "8000", "-ac", "1")
+		a = append(append(a, g711...), "-f", "mulaw", "-ar", "8000", "-ac", "1")
 	case media.PCMA:
-		a = append(a, "-f", "alaw", "-ar", "8000", "-ac", "1")
+		a = append(append(a, g711...), "-f", "alaw", "-ar", "8000", "-ac", "1")
 	case media.AAC:
 		a = append(a, "-f", "aac") // ADTS, headers added in feed
 	default: // Opus is fed as Ogg: ffmpeg has no raw Opus demuxer
