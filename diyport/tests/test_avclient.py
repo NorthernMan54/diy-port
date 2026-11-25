@@ -44,6 +44,7 @@ class Base(unittest.TestCase):
         av._detect_zone_types.clear()
         av._detect_zone_ids.clear()
         av._exclude_zones.clear()
+        av._reverify_policy.clear()
         av._snapshot_filename_to_device.clear()
         av._recent_snapshot_announcements.clear()
         av._last_object_coord_by_device.clear()
@@ -344,6 +345,51 @@ class TestZoneFiltering(Base):
                                   "payload": {"deviceID": "Z", "isLprCamera": 0}}, {})
         self.assertEqual(len(av._detect_zones["Z"]), 2)  # live 11:47: this wiped the zones
         self.assertEqual(av._detect_zone_types["Z"], [["vehicle"], None])
+
+
+class TestReverification(Base):
+    POLICY = {"person": {"enable": True, "mode": "custom",
+                         "minPresenceProbability": 40, "maxPresenceProbability": 80},
+              "vehicle": {"enable": False}, "animal": {"enable": True}}
+
+    def _settings(self, payload, mid=1):
+        av.handle_function(None, {"functionName": "ChangeSmartDetectSettings", "messageId": mid,
+                                  "payload": dict(payload, deviceID="R")}, {})
+
+    def test_policy_parsed_and_kept_on_partial_update(self):
+        self._settings({"reVerificationPolicy": self.POLICY})
+        # Disabled types are dropped; an enabled type without a range gets Protect's 40-80.
+        self.assertEqual(av._reverify_policy["R"], {"person": (40, 80), "animal": (40, 80)})
+        self._settings({"isLprCamera": 0}, mid=2)
+        self.assertEqual(av._reverify_policy["R"], {"person": (40, 80), "animal": (40, 80)})
+        # No AI Key adopted: Protect sends every type disabled.
+        self._settings({"reVerificationPolicy": {"person": {"enable": False}}}, mid=3)
+        self.assertFalse(av._reverify_eligible("R", "person", 60))
+
+    def test_eligible_inside_range_only(self):
+        self._settings({"reVerificationPolicy": self.POLICY})
+        self.assertTrue(av._reverify_eligible("R", "person", 40))
+        self.assertTrue(av._reverify_eligible("R", "person", 80))
+        self.assertFalse(av._reverify_eligible("R", "person", 39))
+        self.assertFalse(av._reverify_eligible("R", "person", 81))
+        self.assertFalse(av._reverify_eligible("R", "vehicle", 60))
+        self.assertFalse(av._reverify_eligible("R", "face", 60))
+        self.assertFalse(av._reverify_eligible("other", "person", 60))
+
+    def test_line_leave_snapshot_carries_flag(self):
+        self._settings({"reVerificationPolicy": self.POLICY})
+        line = {"id": "1", "p1": (0, 500), "p2": (1000, 500),
+                "direction": None, "object_types": None}
+        av._send_line_detect_event(None, "R", line, "leave", 42, "A2B", 1, 0,
+                                   "person", [480, 80, 40, 40], 0.6, 1000, 3)
+        snap = self.sent[-1][1]["smartDetectSnapshots"][0]
+        self.assertTrue(snap["reVerifyEligible"])
+        # The AI daemon only asks for a reverification when this path is non-empty.
+        self.assertEqual(snap["reVerificationSnapshotPath"], snap["smartDetectSnapshot"])
+        av._send_line_detect_event(None, "R", line, "leave", 43, "A2B", 2, 0,
+                                   "person", [480, 80, 40, 40], 0.9, 1000, 4)
+        self.assertFalse(self.sent[-1][1]["smartDetectSnapshots"][0]["reVerifyEligible"])
+        self.assertNotIn("reVerificationSnapshotPath", self.sent[-1][1]["smartDetectSnapshots"][0])
 
 
 class TestLineCrossing(Base):
@@ -984,7 +1030,7 @@ class TestCameraEvent(Base):
         tr = {"objectType": "face", "score": 0.9, "coord": [0, 0, 1, 1], "first_shown_ms": 0,
               "extra": {"faceEmbed": [0.1]}, "embed_reads": 2}
         self.assertIn("faceEmbed", av._track_args(1, tr)["descriptor_extra"])   # never matched
-        tr["match_hits"] = {(186, "Alex"): 1}
+        tr["match_streak"] = ((186, "Alex"), 1)
         self.assertNotIn("faceEmbed", av._track_args(1, tr)["descriptor_extra"])
         tr["embed_reads"] = av.FACE_EMBED_HOLD_READS
         self.assertIn("faceEmbed", av._track_args(1, tr)["descriptor_extra"])   # waited long enough
@@ -2673,8 +2719,9 @@ class TestAnimalOnPerson(Base):
     PERSON = [569, 419, 166, 560]
     ANIMAL = [593, 460, 189, 524]
 
-    def tracks(self, seen_ms=1000, object_type="person"):
-        return {7: {"objectType": object_type, "coord": list(self.PERSON), "seen_ms": seen_ms}}
+    def tracks(self, seen_ms=1000, object_type="person", confirmed=True, score=0.75):
+        return {7: {"objectType": object_type, "coord": list(self.PERSON), "seen_ms": seen_ms,
+                    "confirmed": confirmed, "score": score}}
 
     def types(self, out):
         return sorted(d["objectType"] for d in out)
@@ -2690,6 +2737,23 @@ class TestAnimalOnPerson(Base):
     def test_animal_box_over_a_person_track_is_the_person(self):
         dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
         self.assertEqual(self.types(av._animal_on_person(self.tracks(), dets, 1200)), ["person"])
+
+    def test_weak_unconfirmed_person_track_takes_no_animal(self):
+        # Live 2026-11-12 06:25 on Driveway: a cat confirmed as a person at 0.71.
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(confirmed=False, score=0.71), dets, 1200)
+        self.assertEqual(self.types(out), ["animal"])
+
+    def test_strong_unconfirmed_person_track_still_takes_it(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        out = av._animal_on_person(self.tracks(confirmed=False, score=0.85), dets, 1200)
+        self.assertEqual(self.types(out), ["person"])
+
+    def test_relabel_is_logged_at_info(self):
+        dets = [{"objectType": "animal", "score": 0.82, "coord": list(self.ANIMAL)}]
+        with self.assertLogs(av.log, "INFO") as cm:
+            av._animal_on_person(self.tracks(), dets, 1200)
+        self.assertIn("taken as the person", cm.output[0])
 
     def test_person_box_over_an_animal_track_stays_a_person(self):
         # Replay 13:33 on Driveway: the second person, boxed "animal" at 0.9 first, took every

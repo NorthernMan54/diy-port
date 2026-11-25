@@ -403,6 +403,12 @@ _detect_zone_ids = {}
 _detect_zone_types = {}
 # deviceID -> Line Crossing segments parsed from ChangeSmartDetectSettings.lines.
 _lines = {}
+# deviceID -> {objectType: (min, max)} from ChangeSmartDetectSettings.reVerificationPolicy.
+# Only enabled types are kept. Protect enables a type when an AI Key is adopted and a
+# reverification policy covers the camera; the snapshot then sets reVerifyEligible.
+_reverify_policy = {}
+# Protect's DEFAULT_PRESENCE_PROBABILITY, used when an enabled policy has no range.
+_REVERIFY_DEFAULT_RANGE = (40, 80)
 # Global monotonic counter for fullfov snapshot filenames. It must be global, not
 # per-camera: two cameras' first leave would otherwise announce the same filename.
 _snapshot_seq = itertools.count(1)
@@ -1726,14 +1732,15 @@ def _enrich_detections(device_id, detections):
                     if f.get("size_px", FACE_EMBED_MIN_PX) >= FACE_EMBED_MIN_PX:
                         face["scored"]["faceEmbed"] = (f["embedding"], f["score"])
                     db = _get_face_db()
-                    m = db.match(f["embedding"], FACE_DB_THRESH) if db else None
+                    m = db.match_ranked(f["embedding"], FACE_DB_THRESH) if db else None
                     if m:
-                        subject_id, name, sim = m
-                        face["scored"]["match"] = ((subject_id, name), sim)
+                        subject_id, name, sim, second = m
+                        face["scored"]["match"] = ((subject_id, name), sim, second)
                         people[f["parent"]].setdefault("scored", {})["match"] = (
-                            (subject_id, name), sim)
+                            (subject_id, name), sim, second)
                         log.info("face DB: face on deviceID=%s matches %r (subject %s, "
-                                 "similarity %.3f)", device_id, name, subject_id, sim)
+                                 "similarity %.3f, margin %.3f)", device_id, name, subject_id,
+                                 sim, sim - second)
                 extra.append(face)
                 if f["name"]:
                     people[f["parent"]].setdefault("extra", {}).update(
@@ -1933,7 +1940,13 @@ def _merge_extra(tr, d, device_id=None, tracker_id=None):
     if d.get("fresh_read") and "faceEmbed" in (d.get("scored") or {}):
         tr["embed_reads"] = tr.get("embed_reads", 0) + 1
     scores = tr.setdefault("extra_scores", {})
-    for key, (value, score) in (d.get("scored") or {}).items():
+    for key, val in (d.get("scored") or {}).items():
+        if key == "match":
+            value, score = val[0], val[1]
+            margin = val[2] if len(val) > 2 else None
+        else:
+            value, score = val
+            margin = None
         if key == "name" and tr.get("objectType") == "vehicle":
             reads = tr.setdefault("plate_reads", [])
             reads.append((value, score))
@@ -1950,15 +1963,25 @@ def _merge_extra(tr, d, device_id=None, tracker_id=None):
                          len(reads))
                 tr["plate_logged"] = text
             out[key], scores[key] = text, conf
-        elif key == "match":  # (subject_id, name) from Protect's face DB
-            hits = tr.setdefault("match_hits", collections.Counter())
-            hits[value] += 1
-            best = max(hits, key=lambda k: hits[k])
-            if hits[best] >= FACE_MATCH_HITS and out.get("matchedId") != best[0]:
-                out["matchedId"], out["matchedName"] = best
+        elif key == "match":  # ((subject_id, name), similarity[, second]) from Protect's DB
+            if margin is not None and margin < FACE_DB_MARGIN:
+                tr.pop("match_streak", None)
+                log.debug("face DB: %s tracker_id=%s deviceID=%s ambiguous %r "
+                          "(similarity %.3f, margin %.3f < %.3f)",
+                          tr.get("objectType"), tracker_id, device_id, value, score,
+                          margin, FACE_DB_MARGIN)
+                continue
+            streak = tr.get("match_streak")
+            streak = (value, streak[1] + 1) if streak and streak[0] == value else (value, 1)
+            tr["match_streak"] = streak
+            needed = FACE_MATCH_HITS
+            if out.get("matchedId") is not None and out["matchedId"] != value[0]:
+                needed *= 2  # a named face needs stronger evidence to flip
+            if streak[1] >= needed and out.get("matchedId") != value[0]:
+                out["matchedId"], out["matchedName"] = value
                 log.info("face DB: %s tracker_id=%s deviceID=%s is %r (subject %s, %d "
-                         "matching read(s))", tr.get("objectType"), tracker_id, device_id,
-                         best[1], best[0], hits[best])
+                         "consecutive read(s))", tr.get("objectType"), tracker_id, device_id,
+                         value[1], value[0], streak[1])
         elif score >= scores.get(key, 0):
             out[key] = value
             scores[key] = score
@@ -2002,6 +2025,40 @@ def _parse_zones(zones_field):
     """Parse ChangeSmartDetectSettings zones/excludeZones into polygons
     (even-length coord, >= 3 points)."""
     return [poly for _, _, poly in _valid_zones(zones_field)]
+
+
+def _parse_reverify_policy(policy_field):
+    """Parse ChangeSmartDetectSettings.reVerificationPolicy into {objectType: (min, max)}
+    for the enabled types: {person: {enable, mode, minPresenceProbability,
+    maxPresenceProbability}, vehicle: ..., animal: ...}."""
+    out = {}
+    if not isinstance(policy_field, dict):
+        return out
+    for object_type, p in policy_field.items():
+        if not isinstance(p, dict) or not p.get("enable"):
+            continue
+        lo, hi = p.get("minPresenceProbability"), p.get("maxPresenceProbability")
+        if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
+            lo, hi = _REVERIFY_DEFAULT_RANGE
+        out[str(object_type)] = (lo, hi)
+    return out
+
+
+def _reverify_eligible(device_id, object_type, level):
+    """reVerifyEligible for a snapshot: the policy enables the type and the confidence
+    (0-100) is inside its range, so Protect asks the AI Key to check it again."""
+    rng = _reverify_policy.get(device_id, {}).get(object_type)
+    return rng is not None and rng[0] <= level <= rng[1]
+
+
+def _reverify_fields(device_id, object_type, level, snapshot_name):
+    """Snapshot fields for Second Stage Verification. reVerifyEligible alone is not
+    enough: live, Protect re-checked a snapshot only once it also carried a non-empty
+    reVerificationSnapshotPath. The AI Key is sent an exported clip of the event, so
+    the snapshot's own name serves as the path."""
+    if not _reverify_eligible(device_id, object_type, level):
+        return {"reVerifyEligible": False}
+    return {"reVerifyEligible": True, "reVerificationSnapshotPath": snapshot_name}
 
 
 def _parse_lines(lines_field):
@@ -2110,25 +2167,33 @@ def _dedupe_detections(detections, iou_thresh=0.4):
 # track; vehicles stay separate. AIPORT_CROSS_TYPE_IOU controls the overlap.
 CROSS_TYPE_IOU = envutil.env_float("AIPORT_CROSS_TYPE_IOU", 0.5)
 CROSS_TYPE_RECENT_MS = 1000
+# A person *track* claims an animal box only once confirmed or scoring at least this. Live
+# 2026-11-12 06:25 on Driveway: a cat became person tracker 548, confirmed at a median 0.71
+# (threshold 0.70) with no animal ever logged. An unconfirmed, weak person track on the cat
+# could relabel every "animal" read of it as person and so carry itself to confirmation.
+CROSS_TYPE_TRACK_SCORE = envutil.env_float("AIPORT_CROSS_TYPE_TRACK_SCORE", 0.8)
 
 
 def _animal_on_person(tracks, detections, now_ms, device_id=None):
     """Relabel as person each animal detection overlapping (IoU >= CROSS_TYPE_IOU) a person
-    detection in this frame or a person track seen within CROSS_TYPE_RECENT_MS, then dedupe
+    detection in this frame or a confirmed (or CROSS_TYPE_TRACK_SCORE) person track seen
+    within CROSS_TYPE_RECENT_MS, then dedupe
     the people. Returns the detections left."""
     if CROSS_TYPE_IOU <= 0:
         return detections
     people = [d["coord"] for d in detections if d["objectType"] == "person"]
     people += [tr["coord"] for tr in tracks.values() if tr["objectType"] == "person"
-               and now_ms - tr.get("seen_ms", now_ms) <= CROSS_TYPE_RECENT_MS]
+               and now_ms - tr.get("seen_ms", now_ms) <= CROSS_TYPE_RECENT_MS
+               and (tr.get("confirmed") or tr.get("score", 0.0) >= CROSS_TYPE_TRACK_SCORE)]
     changed = False
     for d in detections:
         if d["objectType"] != "animal":
             continue
         overlap = max((_iou(d["coord"], c) for c in people), default=0.0)
         if overlap >= CROSS_TYPE_IOU:
-            log.debug("real motion tick: animal box over a person (IoU %.2f) taken as the "
-                      "person for deviceID=%s", overlap, device_id)
+            log.info("real motion tick: animal box (score %.2f) over a person (IoU %.2f) "
+                     "taken as the person for deviceID=%s", d.get("score", 0.0), overlap,
+                     device_id)
             d["objectType"] = "person"
             changed = True
     if not changed:
@@ -2429,7 +2494,7 @@ def _face_decided(tr):
     if extra.get("matchedId") is not None:
         return True
     reads = tr.get("embed_reads", 0)
-    return reads >= (FACE_EMBED_HOLD_READS if tr.get("match_hits") else FACE_MATCH_HITS)
+    return reads >= (FACE_EMBED_HOLD_READS if tr.get("match_streak") else FACE_MATCH_HITS)
 
 
 def _track_args(tracker_id, tr, hold_embed=True):
@@ -2719,7 +2784,8 @@ def _send_multi_leave(ws, device_id, event_id, members, fallback):
             })
         snapshots.append({
             "clockBestMonotonic": 0, "clockBestWall": wall, "confidenceLevel": level,
-            "coord": box, "framingRect": box, "reVerifyEligible": False,
+            "coord": box, "framingRect": box,
+            **_reverify_fields(device_id, tr["objectType"], level, name),
             "smartDetectSnapshot": name, "smartDetectSnapshotHeight": SMART_SNAPSHOT_SIZE,
             "smartDetectSnapshotName": "", "smartDetectSnapshotType": tr["objectType"],
             "smartDetectSnapshotWidth": SMART_SNAPSHOT_SIZE, "trackerID": tid,
@@ -3934,6 +4000,10 @@ def _download_face_db(uri, device_info):
 # DB; a face names a subject after FACE_MATCH_HITS matches at AIPORT_FACE_DB_THRESH.
 FACE_MATCH_HITS = 2
 FACE_DB_THRESH = envutil.env_float("AIPORT_FACE_DB_THRESH", 0.45)
+# A read whose best and second-best subjects are closer than this cannot tell them apart.
+# Live 2026-11-22 on the doorbell: 42 px faces scored 0.483 and 0.452 for two subjects in the
+# same second. 0.05 rejects that pair but keeps a clear 0.60 vs 0.40.
+FACE_DB_MARGIN = envutil.env_float("AIPORT_FACE_DB_MARGIN", 0.05)
 # Smallest face read (shorter side, snapshot px) whose embedding is sent to Protect.
 FACE_EMBED_MIN_PX = envutil.env_int("AIPORT_FACE_EMBED_MIN_PX", 60)
 _face_db = None
@@ -4183,7 +4253,7 @@ def _send_smart_detect_event(ws, device_id, edge_type="none", event_id=1, statio
                 "confidenceLevel": t["level"],
                 "coord": snap_coord,
                 "framingRect": snap_coord,
-                "reVerifyEligible": False,
+                **_reverify_fields(device_id, t["object_type"], t["level"], snapshot_filename),
                 "smartDetectSnapshot": snapshot_filename,
                 # Matches the object-crop image, not the full frame.
                 "smartDetectSnapshotHeight": SMART_SNAPSHOT_SIZE,
@@ -4278,7 +4348,7 @@ def _send_line_detect_event(ws, device_id, line, edge_type, event_id, direction,
             "confidenceLevel": confidence_level,
             "coord": real_coord,
             "framingRect": real_coord,
-            "reVerifyEligible": False,
+            **_reverify_fields(device_id, object_type, confidence_level, snapshot_filename),
             "smartDetectSnapshot": snapshot_filename,
             "smartDetectSnapshotHeight": SMART_SNAPSHOT_SIZE,
             "smartDetectSnapshotName": "",
@@ -4956,10 +5026,15 @@ def handle_function(ws, msg, device_info):
                 _detect_zone_ids[device_id] = _parse_zone_ids(payload.get("zones"))
             if "lines" in payload:
                 _lines[device_id] = _parse_lines(payload.get("lines"))
+            if "reVerificationPolicy" in payload:
+                _reverify_policy[device_id] = _parse_reverify_policy(
+                    payload.get("reVerificationPolicy"))
             log.info("ChangeSmartDetectSettings: deviceID=%s now has %d excludeZones "
-                      "polygon(s), %d detection-zone polygon(s), %d Line Crossing segment(s)",
+                      "polygon(s), %d detection-zone polygon(s), %d Line Crossing segment(s), "
+                      "reverification %s",
                       device_id, len(_exclude_zones.get(device_id, ())),
-                      len(_detect_zones.get(device_id, ())), len(_lines.get(device_id, ())))
+                      len(_detect_zones.get(device_id, ())), len(_lines.get(device_id, ())),
+                      _reverify_policy.get(device_id) or "off")
         if msg.get("responseExpected"):
             send_msg(ws, fn, {}, in_response_to=msg_id)
         return
@@ -4978,6 +5053,7 @@ def handle_function(ws, msg, device_info):
         _detect_zone_types.clear()
         _detect_zone_ids.clear()
         _lines.clear()
+        _reverify_policy.clear()
         _snapshot_filename_to_device.clear()
         _last_object_coord_by_device.clear()
         try:
