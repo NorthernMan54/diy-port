@@ -588,20 +588,37 @@ func (r *run) feed(stdin io.Writer, quit <-chan struct{}, lastIn, writingSince *
 	}
 }
 
+// hasParamSets reports whether the AU carries every parameter set its codec needs. An SPS
+// alone is not enough: an SPS-only IDR after an ffmpeg restart starts the decoder without a
+// PPS (H.264) or VPS/PPS (H.265), which fails with "non-existing PPS 0 referenced".
 func hasParamSets(au media.VideoAU, c media.Codec) bool {
+	var vps, sps, pps bool
 	for _, n := range au.NALUs {
 		if len(n) == 0 {
 			continue
 		}
 		if c == media.H265 {
-			if ty := (n[0] >> 1) & 0x3f; ty == 33 {
-				return true
+			switch (n[0] >> 1) & 0x3f {
+			case 32:
+				vps = true
+			case 33:
+				sps = true
+			case 34:
+				pps = true
 			}
-		} else if n[0]&0x1f == 7 {
-			return true
+		} else {
+			switch n[0] & 0x1f {
+			case 7:
+				sps = true
+			case 8:
+				pps = true
+			}
 		}
 	}
-	return false
+	if c == media.H265 {
+		return vps && sps && pps
+	}
+	return sps && pps
 }
 
 // readOutput splits one profile's output pipe into AUs and delivers them.

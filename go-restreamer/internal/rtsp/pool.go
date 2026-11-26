@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -254,12 +255,15 @@ func (e *entry) stamp(pts time.Duration) {
 	}
 }
 
+// urlLogin matches a URL login, including the malformed forms url.Parse rejects.
+var urlLogin = regexp.MustCompile(`(?i)(://)[^/@\s]+@`)
+
 // Redact hides the password (and user) of rawURL for logs and stats; nothing that logs or
 // returns an RTSP URL may skip it.
 func Redact(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.User == nil {
-		return rawURL
+		return urlLogin.ReplaceAllString(rawURL, "${1}***@")
 	}
 	u.User = nil
 	return strings.Replace(u.String(), "//", "//***@", 1)
@@ -268,7 +272,9 @@ func Redact(rawURL string) string {
 // redactErr scrubs the credentials out of an error that may quote the URL (gortsplib's
 // do), including their percent-encoded forms.
 func redactErr(err error, rawURL string) string {
-	msg := err.Error()
+	// The regex also covers a malformed URL that url.Parse rejects, and any other URL login
+	// quoted in the message.
+	msg := urlLogin.ReplaceAllString(err.Error(), "${1}***@")
 	u, perr := url.Parse(rawURL)
 	if perr != nil || u.User == nil {
 		return msg

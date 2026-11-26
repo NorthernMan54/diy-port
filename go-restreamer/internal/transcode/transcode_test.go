@@ -121,6 +121,41 @@ func TestProbeNone(t *testing.T) {
 
 // An ffmpeg that stops reading stdin must not hold up Close: the stdin write used to run in
 // the goroutine that watches ctx, so Close waited on a full pipe forever.
+func TestHasParamSetsRequiresEverySet(t *testing.T) {
+	h264 := func(types ...byte) media.VideoAU {
+		au := media.VideoAU{}
+		for _, ty := range types {
+			au.NALUs = append(au.NALUs, []byte{ty, 0})
+		}
+		return au
+	}
+	h265 := func(types ...byte) media.VideoAU {
+		au := media.VideoAU{}
+		for _, ty := range types {
+			au.NALUs = append(au.NALUs, []byte{ty << 1, 0})
+		}
+		return au
+	}
+	for _, c := range []struct {
+		name  string
+		au    media.VideoAU
+		codec media.Codec
+		want  bool
+	}{
+		{"h264 sps only", h264(0x67), media.H264, false},
+		{"h264 sps+pps", h264(0x67, 0x68), media.H264, true},
+		{"h264 pps only", h264(0x68), media.H264, false},
+		{"h264 idr+sps+pps", h264(0x65, 0x67, 0x68), media.H264, true},
+		{"h265 vps only", h265(32), media.H265, false},
+		{"h265 vps+sps", h265(32, 33), media.H265, false},
+		{"h265 vps+sps+pps", h265(32, 33, 34), media.H265, true},
+	} {
+		if got := hasParamSets(c.au, c.codec); got != c.want {
+			t.Errorf("%s: hasParamSets = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestCloseWithFFmpegIgnoringStdin(t *testing.T) {
 	fake := filepath.Join(t.TempDir(), "ffmpeg")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {

@@ -424,6 +424,49 @@ func TestPusherRebaseRestoresPace(t *testing.T) {
 	}
 }
 
+// A forward PTS jump longer than StallTimeout must not park the run loop in the pace wait:
+// the stall timer still has to end the connection.
+func TestPusherPaceWaitHonoursStall(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	closed := make(chan time.Time, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(io.Discard, c)
+		closed <- time.Now()
+	}()
+	p := NewPusher(Config{Addr: ln.Addr().String(), StreamName: "video1", AudioEnabled: true,
+		Pace: 10 * time.Millisecond, StallTimeout: 100 * time.Millisecond})
+	defer p.Close()
+	// A camera AAC track, so the normalizer does not fill the pacer with silent audio while
+	// the second video tag waits on its future PTS.
+	tr := testTracks()
+	tr.Audio, tr.AudioRate, tr.AudioChannels, tr.AudioConfig = media.AAC, 32000, 1, []byte{0x12, 0x10}
+	p.OnTracks(tr)
+	p.OnVideo(media.VideoAU{PTS: 0, NALUs: [][]byte{{0x65, 0}}, IDR: true})
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Stats().LastFrameTime.IsZero() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	p.OnVideo(media.VideoAU{PTS: 10 * time.Second, NALUs: [][]byte{{0x65, 1}}, IDR: true})
+	select {
+	case at := <-closed:
+		if d := at.Sub(start); d > 2*time.Second {
+			t.Fatalf("pace wait outlived the stall watchdog: %v", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("pace wait kept the connection open: stats=%+v", p.Stats())
+	}
+}
+
 // Opus (type 10): config tag cf 00 03 02 after the AAC config, raw packets as data, trailers
 // at 48000 for Opus and at the AAC rate (32000) for AAC, and one audio ms sequence across both
 // tracks, with Opus on an exact 20 ms grid even when its PTS arrive in a clump.

@@ -654,8 +654,15 @@ func (p *Pusher) pushOnce(si *startInfo) (sentAny bool) {
 			if p.cfg.Pace > 0 {
 				target := w.start.Add(paceShift + p.cfg.Pace + time.Duration(it.ts)*time.Millisecond)
 				if wait := target.Sub(now); wait > 0 {
+					// A forward PTS jump can wait longer than StallTimeout: keep the watchdog
+					// and the resync signal live here, or a dead connection stays open.
 					select {
 					case <-p.ctx.Done():
+						return
+					case <-p.resyncCh:
+						return // tracks changed, source dropped, or fell behind
+					case <-stall.C:
+						p.log.Warn("flv: no frames, ending push", "stream", p.cfg.StreamName)
 						return
 					case <-time.After(wait):
 					}

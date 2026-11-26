@@ -138,6 +138,8 @@ func TestRedact(t *testing.T) {
 	for in, want := range map[string]string{
 		"rtsp://u:p%40ss@h:554/a?x=1": "rtsp://***@h:554/a?x=1",
 		"rtsp://h/a":                  "rtsp://h/a",
+		"rtsp://u:p@h/x":              "rtsp://***@h/x",
+		"rtsp://u:p%zz@h/x":           "rtsp://***@h/x", // url.Parse rejects this one
 	} {
 		if got := Redact(in); got != want {
 			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
@@ -145,5 +147,11 @@ func TestRedact(t *testing.T) {
 	}
 	if got := redactErr(errors.New("dial rtsp://u:p%40ss@h failed: u:p@ss"), "rtsp://u:p%40ss@h/a"); strings.Contains(got, "p%40ss") {
 		t.Errorf("redactErr leaked: %s", got)
+	}
+	if got := redactErr(errors.New("dial rtsp://u:p%zz@h failed"), "rtsp://u:p%zz@h/a"); strings.Contains(got, "p%zz") || strings.Contains(got, "u:") {
+		t.Errorf("redactErr leaked a malformed login: %s", got)
+	}
+	if got := redactErr(errors.New("x rtsp://a:b@h/y"), "rtsp://h/y"); strings.Contains(got, "a:b") {
+		t.Errorf("redactErr leaked an unrelated login: %s", got)
 	}
 }
