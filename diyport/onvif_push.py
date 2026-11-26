@@ -1564,10 +1564,11 @@ def _redact(text):
 
 class RestreamerClient:
     """Newline-delimited JSON-RPC 2.0 client for the Go sidecar's unix socket (go-restreamer/
-    SPEC.md). It keeps the desired configure_camera params per camera and re-sends all of them on
-    every (re)connect: run_all.py restarts the sidecar when it exits and a fresh one knows
-    nothing. Calls never block the caller; a call made while disconnected is just the desired
-    state the next connect sends. Replies are only logged (credentials redacted), except
+    SPEC.md). It keeps the desired configure_camera params per camera and the removes that have
+    not reached the sidecar, and replays both on every (re)connect: run_all.py restarts the
+    sidecar when it exits and a fresh one knows nothing. Calls never block the caller; a call
+    made while disconnected is just the desired state the next connect sends. Replies are only
+    logged (credentials redacted), except
     get_stats, polled every stats_s while connected: its per-channel last_frame_age_ms is what
     last_sent() turns into GoPush.last_sent, so a go channel's stall shows up in avclient's
     _check_restream like any other push's."""
@@ -1577,6 +1578,7 @@ class RestreamerClient:
         self._retry_s = retry_s
         self._lock = threading.Lock()
         self._wanted = {}    # device_id -> configure_camera params
+        self._removed = set()  # device_ids whose remove_camera has not reached the sidecar yet
         self._sock = None
         self._ids = itertools.count(1)
         self._thread = None
@@ -1618,6 +1620,7 @@ class RestreamerClient:
 
     def configure(self, device_id, params):
         with self._lock:
+            self._removed.discard(device_id)  # a later configure cancels a pending remove
             self._wanted[device_id] = params
             self._start_locked()
             self._send_locked("configure_camera", params)
@@ -1625,11 +1628,17 @@ class RestreamerClient:
     def remove(self, device_id):
         with self._lock:
             if self._wanted.pop(device_id, None) is not None:
-                self._send_locked("remove_camera", {"device_id": device_id})
+                # Keep it until the send succeeds: a disconnect here used to drop the remove,
+                # and reconnect replays only _wanted, leaving the sidecar pulling a removed camera.
+                self._removed.add(device_id)
+                if self._send_locked("remove_camera", {"device_id": device_id}):
+                    self._removed.discard(device_id)
 
     def close(self):
         self._stop.set()
         with self._lock:
+            self._wanted.clear()
+            self._removed.clear()
             self._drop_locked()
 
     def _start_locked(self):
@@ -1638,8 +1647,10 @@ class RestreamerClient:
             self._thread.start()
 
     def _send_locked(self, method, params, stats=False):
+        """Send one request; True only when it reached the socket. A failed send also drops the
+        socket, so callers that must survive a reconnect keep their own pending state."""
         if not self._sock:
-            return
+            return False
         msg = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
         if stats:
             if len(self._stats_ids) > 20:  # a sidecar that never answers: don't grow forever
@@ -1652,6 +1663,8 @@ class RestreamerClient:
         except OSError as e:
             log.warning("restreamer send failed (%s): reconnecting", e)
             self._drop_locked()
+            return False
+        return True
 
     def _drop_locked(self):
         sock, self._sock = self._sock, None
@@ -1678,6 +1691,11 @@ class RestreamerClient:
             with self._lock:
                 self._sock = sock
                 self._stats_ids.clear()
+                # Removes first: a device in here is not in _wanted, so the order only matters
+                # if the sidecar kept running through the disconnect.
+                for device_id in list(self._removed):
+                    if self._send_locked("remove_camera", {"device_id": device_id}):
+                        self._removed.discard(device_id)
                 for params in list(self._wanted.values()):
                     self._send_locked("configure_camera", params)
             threading.Thread(target=self._poll_stats, args=(sock,), daemon=True,

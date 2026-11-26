@@ -111,6 +111,32 @@ class TestGoMode(unittest.TestCase):
         self.assertTrue(wait(lambda: any(r["method"] == "remove_camera" for r in fake.requests)))
         self.assertEqual(fake.requests[-1]["params"], {"device_id": "CAM"})
 
+    def test_remove_while_disconnected_is_replayed(self):
+        """A remove during a socket drop must survive: reconnect replays only _wanted, so a
+        dropped remove left the sidecar pulling a camera Protect had removed."""
+        client = onvif_push.RestreamerClient(self.path, retry_s=(0.05,))
+        self.addCleanup(client.close)
+        client.configure("CAM", {"channels": []})  # starts the retry loop; no server yet
+        client.remove("CAM")
+        fake = FakeSidecar(self.path)
+        self.addCleanup(fake.srv.close)
+        self.assertTrue(wait(lambda: fake.requests))
+        self.assertEqual([r["method"] for r in fake.requests], ["remove_camera"])
+        self.assertEqual(fake.requests[0]["params"], {"device_id": "CAM"})
+
+    def test_configure_after_disconnected_remove_cancels_it(self):
+        """Last call wins: a camera configured again while a remove is pending must be
+        configured on reconnect, not removed."""
+        client = onvif_push.RestreamerClient(self.path, retry_s=(0.05,))
+        self.addCleanup(client.close)
+        client.configure("CAM", {"channels": []})
+        client.remove("CAM")
+        client.configure("CAM", {"channels": [{"channel": "video1"}]})
+        fake = FakeSidecar(self.path)
+        self.addCleanup(fake.srv.close)
+        self.assertTrue(wait(lambda: any(r["method"] == "configure_camera" for r in fake.requests)))
+        self.assertFalse(any(r["method"] == "remove_camera" for r in fake.requests))
+
     def _configure(self, m, **parameters):
         m.configure("CAM", {"video1": {"avSerializer": {
             "type": "extendedFlv", "destinations": [DEST],
