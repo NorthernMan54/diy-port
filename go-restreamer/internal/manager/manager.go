@@ -24,11 +24,11 @@ import (
 // Options for New. Zero values are production.
 type Options struct {
 	Hwaccel string // as flag --hwaccel: auto, videotoolbox, none (default auto)
-	// G711AAC re-encodes G.711 to AAC (flag --g711 aac, the default) instead of copying it.
-	// Copied G.711 stuttered in Protect's browser audio under the Python push (user,
-	// 2026-11-12); Python's AAC re-encode ran on wall-clock timestamps and made video stutter
-	// (live 2026-10-28), but this encoder stamps AAC frames by sample count from the first
-	// input PTS, so audio keeps the camera's own clock.
+	// G711AAC re-encodes G.711 to AAC (flag --g711 aac) instead of copying it. Copy is the
+	// default, as in Python and the README: re-encoding G.711 to AAC made Protect's live view
+	// stop and start every second (live 2026-10-28). Python's AAC path also ran on wall-clock
+	// timestamps and made video stutter; this encoder stamps AAC frames by sample count from
+	// the first input PTS, so aac stays as an opt-in A/B knob.
 	G711AAC bool
 	// Opus adds the type-10 Opus track Protect's browser live view plays (flag --opus, default on).
 	Opus bool

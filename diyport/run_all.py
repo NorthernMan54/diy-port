@@ -59,7 +59,7 @@ class RestreamerSupervisor:
                 pass
             began = self._clock()
             try:
-                # AIPORT_ONVIF_G711=copy|aac: the sidecar's G.711 handling (default aac).
+                # AIPORT_ONVIF_G711=copy|aac: the sidecar's G.711 handling (default copy).
                 # AIPORT_ONVIF_OPUS=on|off: the sidecar's browser-live-view Opus track (default on).
                 # AIPORT_ONVIF_AUDIO_SHARE=on|off: one audio ffmpeg per camera URL (default on).
                 # AIPORT_ONVIF_OPUS_RATE: force the Opus sample rate for every channel (default: Protect's).

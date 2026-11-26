@@ -19,9 +19,10 @@ Python wins**. Read it before writing wire code.
   extendedFlv writer, and `Pusher` (a `media.Subscriber`) that dials `dest_host:dest_port`,
   waits for an IDR, writes header/metadata/AVC+AAC sequence headers, then tags with
   ms timestamps from one base PTS (first IDR), clamped monotonic. Reconnects with backoff.
-- `internal/audio`: normalize to AAC-LC: passthrough AAC; G.711/Opus → AAC via a supervised
-  `ffmpeg` subprocess (no CGo); silent AAC fallback (pre-encoded frames, 16 kHz mono,
-  ASC `0x14 0x08`) when there's no audio track or `audio_enabled=false`, paced on video PTS.
+- `internal/audio`: normalize to AAC-LC: passthrough AAC and (by default) G.711 copy; Opus,
+  and G.711 with `--g711 aac`, → AAC via a supervised `ffmpeg` subprocess (no CGo); silent
+  AAC fallback (pre-encoded frames, 16 kHz mono, ASC `0x14 0x08`) when there's no audio track
+  or `audio_enabled=false`, paced on video PTS.
 - `internal/rtsp`: `Pool` keyed by exact rtsp_url, refcounted, one gortsplib v4 client per
   URL (TCP transport) fanning out to subscribers; reconnect 1,2,4..15 s keeping subscribers.
 - `internal/transcode`: H.265 input, or `mode: "transcode"`: one supervised
