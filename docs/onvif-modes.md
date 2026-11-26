@@ -17,6 +17,16 @@ In go mode this process only sends the sidecar `configure_camera` / `remove_came
 unix socket (`restreamer.sock` in the state dir); shared decode reads the sidecar's DetectServer
 at the same `detect_socket()` path. It needs no gst-launch.
 
+The sidecar binary is built with Go 1.27.4:
+
+```bash
+make -C go-restreamer linux-arm64
+```
+
+That writes `go-restreamer/bin/diyport-restreamer-linux-arm64`. `run_all.py` accepts that name
+or `go-restreamer/bin/diyport-restreamer`, and `DIYPORT_RESTREAMER_BIN` overrides both. The
+Docker image builds it in a Go stage.
+
 The transcode needs GStreamer. Without it, the camera logs an error and uses `copy`:
 
 ```bash

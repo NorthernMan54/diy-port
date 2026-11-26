@@ -25,8 +25,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("diyport.run_all")
 
 RESTREAMER_BIN = os.path.join(os.path.dirname(HERE), "go-restreamer", "bin", "diyport-restreamer")
+# make linux-arm64 writes the target suffix; accept either name and an explicit override.
+RESTREAMER_BIN_NAMES = ("diyport-restreamer", "diyport-restreamer-linux-arm64")
 RESTART_MAX_S = 30.0
 RESTART_HEALTHY_S = 60.0  # a run this long starts the backoff again
+
+
+def restreamer_bin():
+    """DIYPORT_RESTREAMER_BIN, else the first sidecar binary a build may have written. The
+    unsuffixed name is what `make` writes; linux-arm64 adds the target suffix."""
+    env = os.environ.get("DIYPORT_RESTREAMER_BIN")
+    if env:
+        return env
+    for name in RESTREAMER_BIN_NAMES:
+        path = os.path.join(os.path.dirname(HERE), "go-restreamer", "bin", name)
+        if os.path.isfile(path):
+            return path
+    return RESTREAMER_BIN  # the canonical path, so the missing-binary error names it
 
 
 class RestreamerSupervisor:
@@ -211,7 +226,7 @@ def main():
     restreamer = None
     if onvif_push.any_go() or envutil.env_bool("DIYPORT_RESTREAMER", False):
         restreamer = RestreamerSupervisor(
-            os.environ.get("DIYPORT_RESTREAMER_BIN") or RESTREAMER_BIN,
+            restreamer_bin(),
             onvif_push.restreamer_sock(args.state_dir))
         restreamer.start()
 

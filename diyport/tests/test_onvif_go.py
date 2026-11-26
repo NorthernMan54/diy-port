@@ -253,6 +253,19 @@ class TestGoMode(unittest.TestCase):
 
 
 class TestSupervisor(unittest.TestCase):
+    def test_binary_resolution_accepts_make_output_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "go-restreamer", "bin")
+            os.makedirs(bindir)
+            target = os.path.join(bindir, "diyport-restreamer-linux-arm64")
+            with open(target, "w"):
+                pass
+            with mock.patch.object(run_all, "HERE", os.path.join(d, "diyport")), \
+                    mock.patch.dict(os.environ, {"DIYPORT_RESTREAMER_BIN": ""}):
+                self.assertEqual(run_all.restreamer_bin(), target)
+                os.environ["DIYPORT_RESTREAMER_BIN"] = "/x"
+                self.assertEqual(run_all.restreamer_bin(), "/x")
+
     def test_missing_binary_logs_one_error_and_does_not_start(self):
         sup = run_all.RestreamerSupervisor("/nonexistent/bin", "/tmp/x.sock")
         with self.assertLogs("diyport.run_all", "ERROR") as logs:
